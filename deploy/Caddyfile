@@ -1,0 +1,6 @@
+# /etc/caddy/Caddyfile — HTTPS automatique (Let's Encrypt). Remplace le nom de domaine.
+quest.exemple.fr {
+	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1
+	}
+}

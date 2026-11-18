@@ -1,0 +1,5 @@
+.env
+data/
+client.log
+node_modules/
+*.bak*

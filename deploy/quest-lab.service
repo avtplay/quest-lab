@@ -1,0 +1,23 @@
+# /etc/systemd/system/quest-lab.service
+[Unit]
+Description=Quest Lab bridge
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User=questlab
+WorkingDirectory=/opt/quest-lab
+EnvironmentFile=/opt/quest-lab/.env
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+# durcissement
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/quest-lab
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
