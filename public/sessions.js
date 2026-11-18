@@ -9,7 +9,8 @@ function makeCard(s) {
   mesh.userData.pick = { type: 'session', id: s.id }; mesh.scale.setScalar(0.01);
   const card = { mesh, target: new THREE.Vector3(), rotY: 0, drawn: '', hover: false, selected: false };
   card.draw = (st, now) => {
-    const key = [st.name, st.status, st.detail, card.hover, card.selected, Math.floor((now - st.seen) / 1000 / (now - st.seen > 60000 ? 30 : 1))].join('|');
+    const note = st.note && st.note.until > now ? st.note : null;
+    const key = [st.name, st.status, st.detail, st.control, st.listening, st.ask?.rid, note?.status, note?.text, card.hover, card.selected, Math.floor((now - st.seen) / 1000 / (now - st.seen > 60000 ? 30 : 1))].join('|');
     if (key === card.drawn) return; card.drawn = key;
     const S = STATUS[st.status] || STATUS.idle;
     g.clearRect(0, 0, CW, CH);
@@ -19,8 +20,12 @@ function makeCard(s) {
     g.shadowColor = S.c; g.shadowBlur = 22; g.fillStyle = S.c; g.beginPath(); g.arc(52, 62, 15, 0, 7); g.fill(); g.shadowBlur = 0;
     g.textBaseline = 'alphabetic'; g.font = '700 50px system-ui'; g.fillStyle = '#eef2ff'; g.fillText(st.name.slice(0, 22), 84, 76);
     g.font = '600 32px system-ui'; g.fillStyle = S.c; g.fillText(S.t, 84, 114);
-    g.font = '32px system-ui'; g.fillStyle = '#c4cef0'; wrap(g, st.detail || '—', 34, 180, CW - 68, 40, 3);
-    g.font = '26px system-ui'; g.fillStyle = '#7a86ab'; g.fillText((st.kind === 'claude-code' ? 'Claude Code' : (st.kind || 'agent')) + (st.machine ? ' · ' + st.machine : ''), 34, CH - 28);
+    if (st.ask) { g.font = '700 32px system-ui'; g.fillStyle = STATUS.waiting.c; g.fillText('Autoriser ? ' + st.ask.tool, 34, 176);
+      g.font = '26px ui-monospace, monospace'; g.fillStyle = '#ecd5f5'; wrap(g, st.ask.summary || '', 34, 212, CW - 68, 32, 2); }
+    else if (note) { g.font = '600 26px system-ui'; g.fillStyle = '#7fd6ff'; g.fillText(note.status === 'queued' ? 'Consigne en attente de livraison' : 'Consigne livrée', 34, 170);
+      g.font = '30px system-ui'; g.fillStyle = '#c4cef0'; wrap(g, note.text, 34, 208, CW - 68, 36, 2); }
+    else { g.font = '32px system-ui'; g.fillStyle = '#c4cef0'; wrap(g, st.detail || '—', 34, 180, CW - 68, 40, 3); }
+    g.font = '26px system-ui'; g.fillStyle = '#7a86ab'; g.fillText((st.kind === 'claude-code' ? 'Claude Code' : (st.kind || 'agent')) + (st.machine ? ' · ' + st.machine : '') + (st.control ? (st.listening ? ' · à l\'écoute' : ' · pilotable') : ''), 34, CH - 28);
     g.textAlign = 'right'; g.fillText(ago(now - st.seen), CW - 34, CH - 28); g.textAlign = 'left';
     t.needsUpdate = true;
   };
@@ -66,7 +71,7 @@ export function createSessions(scene) {
         s = { id: e.id, name: e.label || e.id, status: 'idle', detail: '', kind: e.kind, machine: e.machine, seen: e.t || Date.now() }; sessions.set(e.id, s);
         const card = makeCard(s); card.mesh.position.set(0, 1.5, -1.9); arc.add(card.mesh); cards.set(e.id, card); addPlanet(s, orbitCount++ % 8); relayout();
       }
-      if (e.label) s.name = e.label; if (e.status) s.status = e.status; if (e.detail !== undefined) s.detail = e.detail; if (e.machine) s.machine = e.machine; s.seen = e.t || Date.now();
+      if (e.label) s.name = e.label; if (e.status) s.status = e.status; if (e.detail !== undefined) s.detail = e.detail; if (e.machine) s.machine = e.machine; if (e.control !== undefined) s.control = !!e.control; s.seen = e.t || Date.now();
       const p = planets.get(e.id); if (p) { const col = new THREE.Color(STATUS[s.status]?.c || '#7d9bd0'); p.userData.body.material.color.copy(col); p.userData.glow.material.color.copy(col); p.userData.pulse = 1; }
       return s;
     },
@@ -76,6 +81,7 @@ export function createSessions(scene) {
       sessions.delete(id); if (selected === id) selected = null;
       relayout();
     },
+    rename(id, name) { const s = sessions.get(id); if (!s) return; s.name = name; planets.get(id)?.userData.lab.set(name); },
     select(id) { selected = id; }, hover(id) { hoverId = id; }, get selected() { return selected; },
     pickables() { const out = []; cards.forEach((c) => arc.visible && out.push(c.mesh)); planets.forEach((p) => orrery.visible && out.push(p.userData.hit)); return out; },
     update(dt, now) {

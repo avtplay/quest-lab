@@ -11,7 +11,7 @@ export function createMemory(scene) {
   const stars = [], hits = []; let expanded = false, hover = null, selected = null, data = [];
 
   // portail (miniature cliquable)
-  const portal = new THREE.Mesh(new THREE.SphereGeometry(0.3, 12, 8), new THREE.MeshBasicMaterial()); portal.material.visible = false; portal.userData.pick = { type: 'memory-open' };
+  const portal = new THREE.Mesh(new THREE.SphereGeometry(0.17, 12, 8), new THREE.MeshBasicMaterial()); portal.material.visible = false; portal.userData.pick = { type: 'memory-open' };
   const portalHolder = new THREE.Group(); portalHolder.position.copy(MINI.pos); portalHolder.scale.setScalar(1.5); scene.add(portalHolder); portalHolder.add(portal);
   portal.position.set(0, 0, 0);
   const ring = new THREE.Mesh(new THREE.RingGeometry(0.22, 0.25, 64), new THREE.MeshBasicMaterial({ color: 0x7a95ff, transparent: true, opacity: 0.6, side: THREE.DoubleSide }));

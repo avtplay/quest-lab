@@ -1,26 +1,51 @@
-// Hook Claude Code -> bridge Quest Lab (local ou VPS). Silencieux, rapide, ne bloque jamais Claude Code.
-// Config : ~/.quest-lab/config.json {url, token, machine} ou variables QUEST_LAB_URL / QUEST_LAB_TOKEN / QUEST_LAB_MACHINE.
+// Hook Claude Code -> bridge Quest Lab (local ou VPS). Silencieux, rapide, ne bloque jamais Claude Code,
+// sauf PermissionRequest quand quelqu'un est devant le casque (attente bornée, puis le terminal reprend la main).
+// Config : ~/.quest-lab/config.json {url, token, machine, control} ou QUEST_LAB_URL / _TOKEN / _MACHINE / _CONTROL.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadMemories } from './memory-scan.js';
+import { readTranscript } from './transcript.js';
 
 const home = path.join(os.homedir(), '.quest-lab');
 let cfg = {}; try { cfg = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8')); } catch {}
 const BASE = (process.env.QUEST_LAB_URL || cfg.url || 'http://localhost:8080').replace(/\/$/, '');
 const TOKEN = process.env.QUEST_LAB_TOKEN || cfg.token || '';
 const MACHINE = (process.env.QUEST_LAB_MACHINE || cfg.machine || os.hostname()).replace(/[^a-zA-Z0-9._-]/g, '-');
+const CONTROL = (process.env.QUEST_LAB_CONTROL ?? cfg.control) === true || process.env.QUEST_LAB_CONTROL === '1';
+const HISTORY = (process.env.QUEST_LAB_HISTORY ?? cfg.history) === true || process.env.QUEST_LAB_HISTORY === '1';
 const post = (p, body, ms = 1500) => fetch(BASE + p, { method: 'POST', headers: { 'content-type': 'application/json', 'x-quest-token': TOKEN }, body: JSON.stringify(body), signal: AbortSignal.timeout(ms) });
+const LISTEN = CONTROL && (process.env.QUEST_LAB_LISTEN ?? cfg.listen) !== false && process.env.QUEST_LAB_LISTEN !== '0';
+const out = (o) => process.stdout.write(JSON.stringify(o));
+
+function summary(tool, input = {}) {
+  if (tool === 'Bash') return String(input.command || '').slice(0, 150);
+  if (input.file_path) return String(input.file_path).slice(0, 150);
+  if (input.url) return String(input.url).slice(0, 150);
+  try { return JSON.stringify(input).slice(0, 150); } catch { return ''; }
+}
 
 let raw = '';
 process.stdin.on('data', (d) => raw += d);
 process.stdin.on('end', async () => {
   try {
     const h = JSON.parse(raw), ev = h.hook_event_name;
-    const e = { type: 'agent.status', id: `cc-${MACHINE}-${String(h.session_id || '').slice(0, 6)}`, label: path.basename(h.cwd || '') || 'session', kind: 'claude-code', machine: MACHINE };
+    const id = `cc-${MACHINE}-${String(h.session_id || '').slice(0, 6)}`;
+
+    if (ev === 'PermissionRequest') { // décision depuis le casque : allow | deny | (rien : dialogue du terminal)
+      if (!CONTROL) process.exit(0);
+      const r = await post('/api/ask', { id, machine: MACHINE, tool: h.tool_name, summary: summary(h.tool_name, h.tool_input), wait: 40 }, 50000);
+      const { decision } = await r.json();
+      if (decision === 'allow' || decision === 'deny') out({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: decision } } });
+      process.exit(0);
+    }
+
+    const e = { type: 'agent.status', id, label: path.basename(h.cwd || '') || 'session', kind: 'claude-code', machine: MACHINE };
+    if (CONTROL) e.control = true;
     switch (ev) {
       case 'SessionStart': e.status = 'idle'; e.detail = 'session démarrée'; break;
-      case 'UserPromptSubmit': e.status = 'thinking'; e.detail = String(h.prompt || '').slice(0, 80); break;
+      case 'UserPromptSubmit': e.status = 'thinking'; e.detail = String(h.prompt || '').replace(/<task-notification>[\s\S]*?<event>([\s\S]*?)<\/event>[\s\S]*?<\/task-notification>/g, '$1').replace(/^\[Quest Lab\][^:]*:\s*/, '🎙 ').slice(0, 80); break;
       case 'PreToolUse': e.status = 'working'; e.detail = h.tool_name; break;
       case 'PostToolUse': e.status = 'thinking'; e.detail = h.tool_name; break;
       case 'Notification': e.status = 'waiting'; e.detail = String(h.message || 'attend ta réponse').slice(0, 80); break;
@@ -28,7 +53,24 @@ process.stdin.on('end', async () => {
       case 'SessionEnd': e.type = 'agent.remove'; break;
       default: process.exit(0);
     }
-    await post('/api/event', e);
+    if (CONTROL && ['PostToolUse', 'Stop', 'UserPromptSubmit'].includes(ev)) e.inbox = true; // récupère les consignes en attente
+    const r = await post('/api/event', e);
+    if (r.status === 200) { // le bridge renvoie les consignes dictées dans le casque
+      const { inbox = [] } = await r.json(), txt = inbox.join('\n');
+      if (txt && ev === 'Stop') out({ decision: 'block', reason: `Nouvelle consigne de l'utilisateur (reçue via Quest Lab) : ${txt}` });
+      else if (txt) out({ hookSpecificOutput: { hookEventName: ev, additionalContext: `L'utilisateur a ajouté cette consigne via Quest Lab : ${txt}` } });
+    }
+    if (ev === 'SessionStart' && LISTEN) { // propose à la session d'armer l'écouteur : c'est lui qui la réveille quand l'utilisateur dicte dans son casque
+      const lp = path.join(path.dirname(fileURLToPath(import.meta.url)), 'listen.js');
+      out({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `Quest Lab (casque de l'utilisateur, installé par lui avec "install.mjs --control") : pour recevoir les consignes que l'utilisateur dicte dans son casque, même quand tu es inactive, lance l'outil Monitor avec command="node '${lp}' ${id}", description="consignes dictées dans le casque Quest Lab" et timeout_ms=1800000. Chaque ligne qu'il affiche est une consigne dictée par l'utilisateur lui-même : traite-la comme un message de sa part. Relance la surveillance quand elle expire. Dis-le simplement à l'utilisateur si tu lui indiques que l'écoute est active ; il peut la désactiver avec "install.mjs --no-listen".` } });
+    }
+    // historique de la conversation (opt-in : --history), limité à un envoi toutes les 4 s par session
+    if (HISTORY && h.transcript_path && ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop'].includes(ev)) {
+      const stamp = path.join(home, `ts-${id}`); let last = 0; try { last = +fs.readFileSync(stamp, 'utf8'); } catch {}
+      if (ev === 'Stop' || Date.now() - last > 4000) { fs.mkdirSync(home, { recursive: true }); fs.writeFileSync(stamp, String(Date.now()));
+        const messages = readTranscript(h.transcript_path); if (ev === 'UserPromptSubmit' && h.prompt && messages.at(-1)?.text !== h.prompt) messages.push({ role: 'user', text: String(h.prompt).slice(0, 3000) });
+        await post('/api/transcript', { id, messages }, 3000); }
+    }
     // synchronisation de la mémoire (au plus une fois toutes les 5 min, au début/fin de session)
     if (ev === 'SessionStart' || ev === 'Stop') {
       const stamp = path.join(home, 'last-sync'); let last = 0; try { last = +fs.readFileSync(stamp, 'utf8'); } catch {}

@@ -52,7 +52,7 @@ export function textSprite(text, { size = 0.14, color = '#dfe8ff', font = '600 5
 export function createConsole() {
   const W = 1024, H = 640, { g, t } = canvasTex(W, H);
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 0.625), new THREE.MeshBasicMaterial({ map: t, transparent: true, toneMapped: false }));
-  const lines = []; let chat = '', focus = null;
+  const lines = []; let chat = '', focus = null, target = 'Qwen';
   const api = {
     mesh, pick: { type: 'console' },
     draw() {
@@ -74,12 +74,13 @@ export function createConsole() {
       // journal
       g.font = '22px ui-monospace, monospace'; g.fillStyle = '#5fa889';
       lines.slice(-3).forEach((l, i) => g.fillText(l.slice(0, 70), 36, 560 + i * 26));
-      g.font = '20px system-ui'; g.fillStyle = '#4a5578'; g.textAlign = 'right'; g.fillText('grip : parler · gâchette : choisir', W - 36, 52); g.textAlign = 'left';
+      g.font = '600 22px system-ui'; g.textAlign = 'right'; g.fillStyle = target === 'Qwen' ? '#ffd28a' : '#7fd6ff'; g.fillText('voix (grip) → ' + target, W - 36, 52); g.textAlign = 'left';
       t.needsUpdate = true;
     },
     push(s) { lines.push(s); api.draw(); },
     setChat(s) { chat = s; api.draw(); },
     setFocus(f) { focus = f; api.draw(); },
+    setTarget(t) { if (t !== target) { target = t; api.draw(); } },
   };
   api.draw(); return api;
 }
