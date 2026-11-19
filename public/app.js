@@ -1,11 +1,14 @@
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { buildEnvironment } from './env.js';
+import { buildEnvironment, ENVIRONMENTS } from './env.js';
 import { createConsole, canvasTex, STATUS, TYPE_COLOR, ago, wrap } from './ui.js';
 import { createSessions } from './sessions.js';
 import { createMemory } from './memory.js';
 import { createConvo } from './convo.js';
+import { createReader } from './reader.js';
+import { createList, createKanban, createBoard } from './dev.js';
+import { createRoom } from './room3d.js';
 
 const clog = (m) => { try { fetch('/api/clientlog', { method: 'POST', body: String(m).slice(0, 1500), keepalive: true }); } catch {} };
 addEventListener('error', (e) => clog(`ERR ${e.message} @${e.filename}:${e.lineno}`));
@@ -19,14 +22,40 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 100); camera.position.set(0, 1.6, 1.3);
 const controls = new OrbitControls(camera, renderer.domElement); controls.target.set(0, 1.25, -1.5); controls.update();
 
-const env = buildEnvironment(scene);
+let envName = 'cosmos'; try { envName = localStorage.getItem('questlab.env') || 'cosmos'; } catch {}
+let env = buildEnvironment(scene, envName);
 const log = createConsole(); log.mesh.userData.pick = log.pick;
 const consoleGroup = new THREE.Group(); consoleGroup.position.set(0, 0.92, -0.78); consoleGroup.rotation.order = 'YXZ'; consoleGroup.rotation.x = -0.7; consoleGroup.add(log.mesh); scene.add(consoleGroup);
 const sess = createSessions(scene);
 const memory = createMemory(scene);
+const reader = createReader(); const readerGroup = new THREE.Group(); readerGroup.position.set(0.85, 1.35, -0.9); readerGroup.rotation.order = 'YXZ'; readerGroup.add(reader.mesh); readerGroup.visible = false; scene.add(readerGroup);
 const convo = createConvo(); const convoGroup = new THREE.Group(); convoGroup.position.set(0, 1.55, -1.35); convoGroup.rotation.order = 'YXZ'; convo.mesh.position.set(0, 0, 0); convoGroup.add(convo.mesh); scene.add(convoGroup);
 let lastSel = null, renaming = null; // renaming : id de la session dont on dicte le nouveau nom
-async function loadTranscript(id) { try { const r = await fetch('/api/transcript?id=' + encodeURIComponent(id)); if (r.ok && sess.selected === id) convo.setMessages((await r.json()).messages); } catch {} }
+async function loadTranscript(id) { try { const r = await fetch('/api/transcript?id=' + encodeURIComponent(id)); if (!r.ok) return; const m = (await r.json()).messages;
+  if (sess.selected === id) convo.setMessages(m); pinned.forEach((P) => { if (P.id === id) P.convo.setMessages(m); }); } catch {} }
+// conversations épinglées : plusieurs fenêtres en même temps (max 4), chacune suit sa session
+const PIN_KEY = 'questlab.pins', MAX_PINS = 4, pinned = []; let dictId = null; // dictId : session visée par la voix quand on a touché une fenêtre épinglée
+let pinWanted = []; try { pinWanted = JSON.parse(localStorage.getItem(PIN_KEY) || '[]').filter((x) => typeof x === 'string').slice(0, MAX_PINS); } catch {}
+const savePins = () => { try { localStorage.setItem(PIN_KEY, JSON.stringify(pinned.map((P) => P.id))); } catch {} };
+const dictSession = () => { const id = dictId || sess.selected; return id && sess.sessions.get(id); };
+
+// barre de recherche mémoire : filtres par type + effacer ; la dictée (grip) lance une recherche en texte
+const MEM_TYPES = [['user', 'Moi'], ['feedback', 'Retours'], ['project', 'Projets'], ['reference', 'Réfs']];
+const memBar = (() => { const W = 1280, H = 128, { g, t } = canvasTex(W, H);
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 0.1), new THREE.MeshBasicMaterial({ map: t, transparent: true, toneMapped: false }));
+  m.position.set(0, 0.62, -0.95); m.rotation.x = -0.45; m.userData.pick = { type: 'membar' }; m.visible = false; scene.add(m);
+  const o = { m, buttons: [], key: '' };
+  o.draw = (label, active, key) => { if (key === o.key) return; o.key = key; g.clearRect(0, 0, W, H);
+    g.fillStyle = 'rgba(14,18,42,.94)'; g.beginPath(); g.roundRect(0, 0, W, H, 30); g.fill(); g.strokeStyle = 'rgba(120,150,255,.45)'; g.lineWidth = 3; g.stroke();
+    o.buttons = [...MEM_TYPES.map(([k, l]) => ({ label: l, type: k, color: TYPE_COLOR[k] })), { label: 'Tout', clear: true, color: '#8d97c4' }];
+    const bw = 170, gap = 12; o.buttons.forEach((b, i) => { b.x0 = W - 24 - (o.buttons.length - i) * (bw + gap) + gap; b.x1 = b.x0 + bw; });
+    g.textBaseline = 'middle'; g.textAlign = 'left'; g.font = '600 30px system-ui'; g.fillStyle = '#cdd6ff'; const room = o.buttons[0].x0 - 52; let txt = label; while (txt.length > 4 && g.measureText(txt).width > room) txt = txt.slice(0, -2) + '…'; g.fillText(txt, 28, H / 2);
+    o.buttons.forEach((b) => { const on = b.type && active.has(b.type); g.fillStyle = on ? b.color : 'rgba(40,48,90,.9)'; g.beginPath(); g.roundRect(b.x0, 20, bw, 88, 22); g.fill(); if (!on) { g.strokeStyle = b.color; g.lineWidth = 3; g.stroke(); } g.fillStyle = on ? '#0b0f20' : '#dfe6ff'; g.font = '700 30px system-ui'; g.textAlign = 'center'; g.fillText(b.label, (b.x0 + b.x1) / 2, H / 2); });
+    t.needsUpdate = true; };
+  return o; })();
+function memSearch(text) { // dictée en mode mémoire : « tout » / « effacer » remet à zéro, sinon recherche
+  if (/^\s*(tout|effacer|reset|réinitialiser|annuler)[.!\s]*$/i.test(text)) { memory.setFilter('', []); log.setChat('Recherche effacée.'); return; }
+  const n = memory.setFilter(text, [...memory.filter.types]); log.setChat(n ? `🔎 « ${text} » : ${n} souvenir${n > 1 ? 's' : ''}.` : `🔎 « ${text} » : rien trouvé.`); }
 
 // bouton retour (visible en mode mémoire plein écran)
 const back = (() => { const { g, t } = canvasTex(384, 128); g.fillStyle = 'rgba(20,26,58,.95)'; g.beginPath(); g.roundRect(4, 4, 376, 120, 40); g.fill(); g.strokeStyle = '#7a95ff'; g.lineWidth = 4; g.stroke();
@@ -55,6 +84,9 @@ function smallButton(label, pick, x, y = -0.444) { const { g, t } = canvasTex(38
   m.position.set(x, y, 0.031); m.userData.pick = pick; consoleGroup.add(m); return m; }
 const reloadBtn = smallButton('↻ Recharger', { type: 'reload' }, -0.66);
 const layoutBtn = smallButton('⟲ Disposition', { type: 'reset-layout' }, 0.66);
+const envBtn = smallButton('🌌 Décor', { type: 'next-env' }, 0.66, -0.55);
+const shotBtn = smallButton('📷 Capture', { type: 'shot' }, 0, -0.55);
+const devBtn = smallButton('🛠 Atelier', { type: 'toggle-dev' }, -0.33, -0.55);
 const launchBtn = smallButton('+ Session', { type: 'open-launcher' }, -0.66, -0.55);
 
 // ---- écrans déplaçables et redimensionnables, comme les fenêtres de l'OS du Quest
@@ -68,13 +100,77 @@ function addPanel(name, group, halfW, halfH) {
     for (const o of [0.3, 0.5, 0.7]) { g.beginPath(); g.moveTo(w * 0.85, h * o + h * 0.15); g.lineTo(w * o + w * 0.15, h * 0.85); g.stroke(); } });
   handle.position.set(0, halfH + 0.06, 0.005); corner.position.set(halfW + 0.05, -halfH - 0.05, 0.005);
   handle.userData.pick = { type: 'handle', panel: name }; corner.userData.pick = { type: 'corner', panel: name };
-  group.add(handle, corner); panels[name] = { name, group, handle, corner, home: group.position.clone() };
+  group.add(handle, corner); panels[name] = { name, group, handle, corner, home: group.position.clone(), homeScale: group.scale.x };
 }
-addPanel('convo', convoGroup, 0.75, 0.469); addPanel('console', consoleGroup, 0.5, 0.3125);
+addPanel('convo', convoGroup, 0.75, 0.469); addPanel('reader', readerGroup, 0.6, 0.375); addPanel('sessions', sess.orrery, 0.34, 0.26); addPanel('memory', memory.holder, 0.34, 0.26);
+for (const n of ['sessions', 'memory']) { panels[n].handle.scale.setScalar(0.45); panels[n].corner.scale.setScalar(0.55); }
+panels.reader.home.copy(readerGroup.position); addPanel('console', consoleGroup, 0.5, 0.3125); // les galaxies sont déjà agrandies ×1,5 : poignées plus petites
 const faceUser = (P) => { P.group.rotation.y = Math.atan2(-P.group.position.x, -P.group.position.z); }; // se tourne vers l'utilisateur, resté à l'origine
 function saveLayout() { try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(Object.fromEntries(Object.entries(panels).map(([n, P]) => [n, { p: P.group.position.toArray(), s: P.group.scale.x }])))); } catch {} }
-function resetLayout() { for (const P of Object.values(panels)) { P.group.position.copy(P.home); P.group.scale.setScalar(1); faceUser(P); } try { localStorage.removeItem(LAYOUT_KEY); } catch {} }
+function resetLayout() { for (const P of Object.values(panels)) { P.group.position.copy(P.home); P.group.scale.setScalar(P.homeScale ?? 1); faceUser(P); } try { localStorage.removeItem(LAYOUT_KEY); } catch {} }
 try { for (const [n, v] of Object.entries(JSON.parse(localStorage.getItem(LAYOUT_KEY) || '{}'))) { const P = panels[n]; if (P && Array.isArray(v.p) && v.p.length === 3 && v.p.every(Number.isFinite)) { P.group.position.fromArray(v.p); P.group.scale.setScalar(Math.min(2.5, Math.max(0.5, +v.s || 1))); faceUser(P); } } } catch {}
+function closeMesh() { const { g, t } = canvasTex(128, 128); g.fillStyle = 'rgba(255,107,125,.9)'; g.beginPath(); g.arc(64, 64, 58, 0, 7); g.fill(); g.strokeStyle = '#fff'; g.lineWidth = 12; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(40, 40); g.lineTo(88, 88); g.moveTo(88, 40); g.lineTo(40, 88); g.stroke(); t.needsUpdate = true;
+  return new THREE.Mesh(new THREE.PlaneGeometry(0.075, 0.075), new THREE.MeshBasicMaterial({ map: t, transparent: true, toneMapped: false })); }
+function pinSession(id) {
+  if (!id || pinned.some((P) => P.id === id) || pinned.length >= MAX_PINS) return false;
+  const i = pinned.length, a = (i % 2 ? 1 : -1) * (0.95 + 0.4 * Math.floor(i / 2)), name = 'pin-' + id;
+  const c = createConvo(); c.mesh.userData.pick = { type: 'convo', id }; c.mesh.position.set(0, 0, 0); c.mesh.visible = true;
+  const group = new THREE.Group(); group.rotation.order = 'YXZ'; group.position.set(Math.sin(a) * 1.7, 1.45, -Math.cos(a) * 1.7); group.scale.setScalar(0.6); group.add(c.mesh);
+  const x = closeMesh(); x.position.set(0.77, 0.5, 0.02); x.userData.pick = { type: 'unpin', id }; group.add(x); scene.add(group);
+  addPanel(name, group, 0.75, 0.469); faceUser(panels[name]);
+  try { const v = JSON.parse(localStorage.getItem(LAYOUT_KEY) || '{}')[name]; if (v && Array.isArray(v.p) && v.p.length === 3 && v.p.every(Number.isFinite)) { group.position.fromArray(v.p); group.scale.setScalar(Math.min(2.5, Math.max(0.5, +v.s || 1))); faceUser(panels[name]); } } catch {}
+  pinned.push({ id, name, convo: c, group, close: x }); savePins(); loadTranscript(id); return true;
+}
+function unpinSession(id) { const k = pinned.findIndex((P) => P.id === id); if (k < 0) return; const P = pinned[k]; scene.remove(P.group); P.group.traverse((o) => { o.geometry?.dispose(); o.material?.map?.dispose(); o.material?.dispose?.(); });
+  delete panels[P.name]; pinned.splice(k, 1); pinWanted = pinWanted.filter((x) => x !== id); if (dictId === id) dictId = null; if (scrollTarget === P.convo) scrollTarget = convo; savePins(); }
+// ---- atelier de développement : Changements, Sortie, Tâches, Tableau (visibles pour la session visée, bouton 🛠 Atelier)
+const devPanels = {}; let devOn = false; try { devOn = localStorage.getItem('questlab.dev') === '1'; } catch {}
+const devStore = new Map(), devDirty = new Set(); let devLoadedId = null, devLoadedAt = 0;
+function mkDev(name, impl, pos, sc) {
+  const group = new THREE.Group(); group.rotation.order = 'YXZ'; group.position.set(...pos); group.scale.setScalar(sc); impl.mesh.userData.pick = { type: 'dev', name }; group.add(impl.mesh); group.visible = false; scene.add(group);
+  addPanel('dev-' + name, group, 0.6, 0.375); faceUser(panels['dev-' + name]);
+  try { const v = JSON.parse(localStorage.getItem(LAYOUT_KEY) || '{}')['dev-' + name]; if (v && Array.isArray(v.p) && v.p.length === 3 && v.p.every(Number.isFinite)) { group.position.fromArray(v.p); group.scale.setScalar(Math.min(2.5, Math.max(0.5, +v.s || 1))); faceUser(panels['dev-' + name]); } } catch {}
+  devPanels[name] = { impl, group };
+}
+mkDev('changes', createList('changes'), [-1.3, 1.5, -1.0], 0.75); mkDev('output', createList('output'), [1.3, 1.5, -1.0], 0.75);
+mkDev('todos', createKanban(), [0, 2.3, -1.35], 0.8); const board = createBoard(); mkDev('board', board, [1.35, 0.8, -0.8], 0.7);
+async function loadDev(id) { devLoadedId = id; devLoadedAt = Date.now(); devDirty.delete(id); try { const r = await fetch('/api/dev?id=' + encodeURIComponent(id)); if (r.ok) devStore.set(id, await r.json()); } catch {} }
+function updateDev() {
+  const ds = dictSession(), show = devOn && !!ds && !memory.expanded; for (const P of Object.values(devPanels)) P.group.visible = show; if (!show) return;
+  if ((devLoadedId !== ds.id || devDirty.has(ds.id)) && Date.now() - devLoadedAt > 700) loadDev(ds.id);
+  const d = devStore.get(ds.id), now = Date.now(); if (!board.drawing) board.showDiagram(ds.id, d?.diagram); devPanels.changes.impl.draw(ds, d, now); devPanels.output.impl.draw(ds, d, now); devPanels.todos.impl.draw(ds, d);
+}
+async function sendBoard() {
+  const ds = dictSession(); if (!ds || !controllable(ds)) { log.setChat('Le tableau s\'envoie à une session pilotable : sélectionne-en une.'); return; }
+  try { const r = await fetch('/api/board?id=' + encodeURIComponent(ds.id), { method: 'POST', body: await board.toBlob() }); log.setChat(r.ok || r.status === 204 ? `Schéma envoyé à ${ds.name}.` : `Envoi refusé (${r.status})`); } catch (e) { log.setChat('Envoi impossible : ' + e.message); }
+}
+// ---- salle blanche : objets 3D de la session visée (décor « Salle blanche »), saisis et déplacés à la manette
+const room = createRoom(scene), roomStore = new Map(), roomDirty = new Set(); let roomLoadedId = null, roomLoadedAt = 0, roomDrag = null;
+async function loadRoom(id) { roomLoadedId = id; roomLoadedAt = Date.now(); roomDirty.delete(id); try { const r = await fetch('/api/room?id=' + encodeURIComponent(id)); if (r.ok) roomStore.set(id, (await r.json()).objects); } catch {} }
+function updateRoom() {
+  const ds = dictSession(), show = envName === 'salle' && !!ds && !memory.expanded; room.group.visible = show; if (!show) return;
+  if ((roomLoadedId !== ds.id || roomDirty.has(ds.id)) && Date.now() - roomLoadedAt > 500) loadRoom(ds.id);
+  if (!roomDrag) room.apply(roomStore.get(ds.id) ?? [], null); else room.apply(roomStore.get(roomDrag.sid) ?? [], roomDrag.name);
+}
+function startRoomDrag(name, dist, src) { const o = room.get(name), ds = dictSession(); if (!o || !ds) return; ray.ray.at(dist, _p); roomDrag = { name, src, dist, sid: ds.id, off: o.position.clone().sub(_p), sc: 1 }; if (src === 'mouse') controls.enabled = false; }
+function updateRoomDrag(dt) {
+  if (!roomDrag) return; const o = room.get(roomDrag.name); if (!o) { roomDrag = null; return; } const src = roomDrag.src;
+  if (src === 'mouse') ray.setFromCamera(mouse, camera); else rayFrom(src);
+  const ax = src !== 'mouse' ? src.userData.src?.gamepad?.axes : null;
+  if (ax) { const y = ax[3] ?? 0, x = ax[2] ?? 0; if (Math.abs(y) > 0.2) roomDrag.dist = Math.min(6, Math.max(0.3, roomDrag.dist + y * dt * 1.5)); if (Math.abs(x) > 0.2) { roomDrag.sc = Math.min(8, Math.max(0.2, roomDrag.sc * (1 + x * dt * 1.2))); o.scale.setScalar(roomDrag.sc); } }
+  ray.ray.at(roomDrag.dist, _p); o.position.copy(_p).add(roomDrag.off); o.position.y = Math.max(0, o.position.y);
+}
+async function endRoomDrag() {
+  if (!roomDrag) return; const d = roomDrag; roomDrag = null; controls.enabled = true; const o = room.get(d.name), spec = room.spec(d.name); if (!o || !spec) return;
+  const r3 = (v) => Math.round(v * 1000) / 1000, size = Array.isArray(spec.size) ? spec.size.map((v) => r3(v * d.sc)) : r3(spec.size * d.sc);
+  const list = roomStore.get(d.sid); const m = list?.find((x) => x.name === d.name); if (m) { m.pos = o.position.toArray().map(r3); m.size = size; }
+  try { await fetch('/api/room', { method: 'POST', body: JSON.stringify({ id: d.sid, op: 'move', name: d.name, pos: o.position.toArray().map(r3), size }) }); } catch {}
+}
+let boardSrc = null; // contrôleur (ou 'mouse') qui trace en ce moment
+function boardPress(uv, src) { const a = board.press(uv); if (a === 'clear') board.clear(); else if (a === 'send') sendBoard(); else boardSrc = src; }
+function boardMove() { if (!boardSrc || !board.drawing) return; if (boardSrc === 'mouse') ray.setFromCamera(mouse, camera); else rayFrom(boardSrc); const h = ray.intersectObject(board.mesh, false)[0]; if (h?.uv) board.move(h.uv); }
+let scrollTarget = convo;
 let drag = null; const _p = new THREE.Vector3(), _n = new THREE.Vector3(), _q = new THREE.Quaternion();
 function startDrag(pk, dist, src) {
   const P = panels[pk.panel]; if (!P) return; ray.ray.at(dist, _p);
@@ -149,11 +245,19 @@ function onLaunchEvent(e) {
   if (e.status === 'started' && e.id) { launcher.pendingSelect = e.id; setTimeout(closeLauncher, 1500); }
 }
 const controllable = (s) => s && s.control;
+function updateMemoryUI() {
+  readerGroup.visible = memory.expanded && !!reader.memory; if (readerGroup.visible) reader.draw();
+  memBar.m.visible = memory.expanded; if (memory.expanded) { const f = memory.filter; memBar.draw(f.q || f.types.size ? `🔎 ${f.q ? '« ' + f.q + ' » · ' : ''}${f.n} trouvé${f.n > 1 ? 's' : ''}` : 'Grip + parle pour chercher · touche un amas pour s\'en approcher', f.types, f.q + [...f.types] + f.n); }
+}
 function updateBar() {
+  updateMemoryUI();
   const s = sess.selected && sess.sessions.get(sess.selected); bar.m.visible = !!s && !memory.expanded;
-  log.setTarget(s && controllable(s) ? s.name + ' (consigne)' : 'Qwen');
+  if (dictId && !sess.sessions.has(dictId)) dictId = null;
+  const ds = dictSession(); log.setTarget(ds && controllable(ds) ? ds.name + ' (consigne)' : 'Qwen');
+  for (const id of [...pinWanted]) if (sess.sessions.has(id)) { if (!pinned.some((P) => P.id === id)) pinSession(id); pinWanted = pinWanted.filter((x) => x !== id); }
+  for (const P of [...pinned]) { const ps = sess.sessions.get(P.id); if (!ps) { unpinSession(P.id); continue; } P.group.visible = !memory.expanded; if (P.group.visible) P.convo.draw(ps, Date.now()); }
   // une session sélectionnée prend la scène : on masque l'arc des autres cartes et on affiche sa conversation
-  sess.orrery.visible = !memory.expanded; sess.arc.visible = !memory.expanded && !s; convo.mesh.visible = !!s && !memory.expanded; convoGroup.visible = convo.mesh.visible;
+  sess.orrery.visible = !memory.expanded; sess.arc.visible = !memory.expanded && !s; convo.mesh.visible = !!s && !memory.expanded && !pinned.some((P) => P.id === s.id); convoGroup.visible = convo.mesh.visible;
   if (launcher.pendingSelect && sess.sessions.has(launcher.pendingSelect)) { memory.select(null); sess.select(launcher.pendingSelect); launcher.pendingSelect = null; }
   if ((sess.selected || null) !== lastSel) { lastSel = sess.selected || null; convo.reset(); if (lastSel) loadTranscript(lastSel); }
   if (s) convo.draw(s, Date.now());
@@ -161,8 +265,8 @@ function updateBar() {
   if (renaming && renaming !== s.id) renaming = null;
   if (renaming) bar.draw(`Dicte le nouveau nom de ${s.name}`, [{ label: 'Annuler', color: '#8d97c4', act: { cancelRename: true } }], 'ren' + s.id);
   else if (s.ask) bar.draw(`Autoriser ${s.ask.tool} ?`, [{ label: 'Autoriser', color: '#38e08f', act: { decide: 'allow' } }, { label: 'Refuser', color: '#ff6b7d', act: { decide: 'deny' } }, { label: 'Terminal', color: '#8d97c4', act: { decide: 'pass' } }], 'ask' + s.ask.rid);
-  else if (controllable(s)) bar.draw(s.listening ? `grip : ta voix réveille ${s.name} aussitôt` : `grip : ta voix va à ${s.name}, lue à son prochain tour`, [{ label: 'Renommer', color: '#ffd28a', act: { rename: true } }, { label: 'Fermer', color: '#8d97c4', act: { clear: true } }], 'dict' + s.id + !!s.listening);
-  else bar.draw(`${s.name} : lecture seule (installer avec --control)`, [{ label: 'Renommer', color: '#ffd28a', act: { rename: true } }, { label: 'Fermer', color: '#8d97c4', act: { clear: true } }], 'ro' + s.id);
+  else if (controllable(s)) bar.draw(s.listening ? `grip : ta voix réveille ${s.name} aussitôt` : `grip : ta voix va à ${s.name}, lue à son prochain tour`, [{ label: pinned.some((P) => P.id === s.id) ? 'Détacher' : 'Épingler', color: '#7fd6ff', act: { pin: true } }, { label: 'Renommer', color: '#ffd28a', act: { rename: true } }, { label: 'Fermer', color: '#8d97c4', act: { clear: true } }], 'dict' + s.id + !!s.listening + pinned.some((P) => P.id === s.id));
+  else bar.draw(`${s.name} : lecture seule (installer avec --control)`, [{ label: pinned.some((P) => P.id === s.id) ? 'Détacher' : 'Épingler', color: '#7fd6ff', act: { pin: true } }, { label: 'Renommer', color: '#ffd28a', act: { rename: true } }, { label: 'Fermer', color: '#8d97c4', act: { clear: true } }], 'ro' + s.id + pinned.some((P) => P.id === s.id));
 }
 
 // ---- événements (polling : robuste derrière un tunnel)
@@ -173,7 +277,9 @@ function onEvent(e) {
   if (e.type === 'agent.rename') { sess.rename(e.id, e.name); refocus(); }
   if (e.type === 'runner.update' || e.type === 'launch.update') onLaunchEvent(e);
   if (e.type === 'agent.listen') { const s = sess.sessions.get(e.id); if (s) s.listening = e.on; }
-  if (e.type === 'agent.transcript' && e.id === sess.selected) loadTranscript(e.id);
+  if (e.type === 'agent.dev') devDirty.add(e.id);
+  if (e.type === 'agent.room') roomDirty.add(e.id);
+  if (e.type === 'agent.transcript' && (e.id === sess.selected || pinned.some((P) => P.id === e.id))) loadTranscript(e.id);
   if (e.type === 'agent.ask') { const s = sess.sessions.get(e.id); if (s) { s.ask = { rid: e.rid, tool: e.tool, summary: e.summary }; s.status = 'waiting'; s.seen = e.t;
     memory.select(null); sess.select(e.id); log.push(`${s.name} demande : ${e.tool}`); refocus(); } }
   if (e.type === 'agent.ask.done') { const s = sess.sessions.get(e.id); if (s && s.ask?.rid === e.rid) { s.ask = null; s.status = e.decision === 'deny' ? 'idle' : 'working'; s.seen = e.t; log.push(`${s.name} : ${e.decision === 'allow' ? 'autorisé' : e.decision === 'deny' ? 'refusé' : 'laissé au terminal'}`); refocus(); } }
@@ -195,43 +301,68 @@ async function instruct(s, text) {
   log.setChat(`→ ${s.name} : ${text}\n(${s.listening ? 'session à l\'écoute : elle la reçoit tout de suite' : s.status === 'idle' ? 'session inactive et sans écouteur : elle la lira à son prochain tour' : 'livrée au prochain outil'})`);
   try { const r = await fetch('/api/instruct', { method: 'POST', body: JSON.stringify({ id: s.id, text }) }); if (!r.ok) log.setChat(`Consigne refusée (${r.status}) : ${await r.text()}`); } catch (e) { log.setChat('Consigne impossible : ' + e.message); }
 }
+// capture : rend la scène depuis le point de vue du casque (ou de la souris) dans une image hors écran et l'envoie au bridge (data/shot.png)
+async function captureShot() {
+  const W = 1280, H = 720; log.setChat('Capture en cours…');
+  try {
+    const rt = new THREE.WebGLRenderTarget(W, H, { colorSpace: THREE.SRGBColorSpace }), cam = new THREE.PerspectiveCamera(70, W / H, 0.05, 100);
+    if (renderer.xr.isPresenting) { const xc = renderer.xr.getCamera(); xc.updateMatrixWorld(true); xc.matrixWorld.decompose(cam.position, cam.quaternion, new THREE.Vector3()); } else { camera.updateMatrixWorld(true); cam.position.copy(camera.position); cam.quaternion.copy(camera.quaternion); }
+    cam.updateMatrixWorld(true); const was = renderer.xr.enabled; renderer.xr.enabled = false; renderer.setRenderTarget(rt); renderer.render(scene, cam); renderer.setRenderTarget(null); renderer.xr.enabled = was;
+    const px = new Uint8Array(W * H * 4); renderer.readRenderTargetPixels(rt, 0, 0, W, H, px); rt.dispose();
+    const cv = document.createElement('canvas'); cv.width = W; cv.height = H; const g2 = cv.getContext('2d'), img = g2.createImageData(W, H);
+    for (let y = 0; y < H; y++) img.data.set(px.subarray((H - 1 - y) * W * 4, (H - y) * W * 4), y * W * 4);
+    g2.putImageData(img, 0, 0); const blob = await new Promise((r) => cv.toBlob(r, 'image/png'));
+    const r = await fetch('/api/shot', { method: 'POST', body: blob }); log.setChat(r.ok ? 'Capture envoyée : Claude peut la voir.' : 'Capture refusée (' + r.status + ')');
+  } catch (e) { log.setChat('Capture impossible : ' + e.message); }
+}
 function act(p, uv) {
   if (!p) return;
   if (p.type === 'reload') { location.reload(); return; }
+  if (p.type === 'next-env') { env.dispose(); envName = ENVIRONMENTS[(ENVIRONMENTS.findIndex((e) => e[0] === envName) + 1) % ENVIRONMENTS.length][0]; try { localStorage.setItem('questlab.env', envName); } catch {} env = buildEnvironment(scene, envName); return; }
+  if (p.type === 'shot') { captureShot(); return; }
+  if (p.type === 'toggle-dev') { devOn = !devOn; try { localStorage.setItem('questlab.dev', devOn ? '1' : '0'); } catch {} log.setChat(devOn ? 'Atelier ouvert : Changements, Sortie, Tâches, Tableau (session sélectionnée).' : 'Atelier fermé.'); return; }
   if (p.type === 'open-launcher') { openLauncher(); return; }
   if (p.type === 'launcher') { launcherClick(uv); return; }
-  if (p.type === 'reset-layout') { resetLayout(); return; }
+  if (p.type === 'reset-layout') { [...pinned].forEach((P) => unpinSession(P.id)); pinWanted = []; savePins(); resetLayout(); return; }
   if (p.type === 'bar') { const s = sess.selected && sess.sessions.get(sess.selected); const x = (uv?.x ?? 0) * 1024, b = bar.buttons.find((k) => x >= k.x0 && x <= k.x1);
-    if (b?.act.decide && s?.ask) decide(s.ask.rid, b.act.decide); if (b?.act.clear) { sess.select(null); log.setFocus(null); }
+    if (b?.act.decide && s?.ask) decide(s.ask.rid, b.act.decide); if (b?.act.clear) { sess.select(null); dictId = null; log.setFocus(null); }
     if (b?.act.rename && s) { renaming = s.id; log.setChat('Maintiens le grip et dis le nouveau nom (ou tape-le en bas sur PC).'); }
+    if (b?.act.pin && s) { if (pinned.some((P) => P.id === s.id)) unpinSession(s.id); else if (!pinSession(s.id)) log.setChat(`Maximum ${MAX_PINS} fenêtres épinglées : ferme-en une avec ✕.`); bar.key = ''; }
     if (b?.act.cancelRename) { renaming = null; log.setChat(''); } }
-  if (p.type === 'session') { memory.select(null); sess.select(p.id); refocus(); }
+  if (p.type === 'convo') { dictId = null; memory.select(null); sess.select(p.id); refocus(); return; } // toucher une fenêtre épinglée la sélectionne : barre d'actions, voix et permissions s'y appliquent
+  if (p.type === 'unpin') { unpinSession(p.id); return; }
+  if (p.type === 'session') { dictId = null; memory.select(null); sess.select(p.id); refocus(); }
+  if (p.type === 'membar') { const x = (uv?.x ?? 0) * 1280, b = memBar.buttons.find((k) => x >= k.x0 && x <= k.x1);
+    if (b?.clear) memory.setFilter('', []); else if (b) { const ty = new Set(memory.filter.types); ty.has(b.type) ? ty.delete(b.type) : ty.add(b.type); memory.setFilter(memory.filter.q, [...ty]); } return; }
+  if (p.type === 'cluster') { memory.focusCluster(p.name); return; }
   if (p.type === 'memory-open') { memory.setExpanded(true); sess.arc.visible = false; sess.orrery.visible = false; back.visible = true; }
-  if (p.type === 'back') { memory.setExpanded(false); sess.arc.visible = true; sess.orrery.visible = true; back.visible = false; }
-  if (p.type === 'memory') { const m = memory.find(p.id); sess.select(null); memory.select(p.id);
+  if (p.type === 'back') { reader.set(null); memory.select(null); memory.setExpanded(false); sess.arc.visible = true; sess.orrery.visible = true; back.visible = false; }
+  if (p.type === 'memory') { const m = memory.find(p.id); sess.select(null); memory.select(p.id); reader.set(m);
     log.setFocus({ title: m.name, color: TYPE_COLOR[m.type], text: `[${m.project} · ${m.type}] ${m.description || ''}\n${m.body.replace(/\s+/g, ' ').slice(0, 220)}` }); }
 }
 const vis = (o) => { for (; o; o = o.parent) if (!o.visible) return false; return true; };
 const ray = new THREE.Raycaster(); ray.far = 12;
 const tmpM = new THREE.Matrix4();
 function rayFrom(c) { c.updateMatrixWorld(true); tmpM.identity().extractRotation(c.matrixWorld); ray.ray.origin.setFromMatrixPosition(c.matrixWorld); ray.ray.direction.set(0, 0, -1).applyMatrix4(tmpM).normalize(); }
-function pick(r) { const objs = [...sess.pickables(), ...memory.pickables(), back, log.mesh, bar.m, convo.mesh, reloadBtn, layoutBtn, launchBtn, launcher.mesh, ...Object.values(panels).flatMap((P) => [P.handle, P.corner])].filter(vis); const h = r.intersectObjects(objs, false)[0]; return h ? { p: h.object.userData.pick, d: h.distance, uv: h.uv } : null; }
+function pick(r) { const objs = [...sess.pickables(), ...memory.pickables(), back, log.mesh, bar.m, memBar.m, reader.mesh, ...Object.values(devPanels).map((P) => P.impl.mesh), ...room.pickables(), convo.mesh, ...pinned.flatMap((P) => [P.convo.mesh, P.close]), reloadBtn, layoutBtn, envBtn, shotBtn, devBtn, launchBtn, launcher.mesh, ...Object.values(panels).flatMap((P) => [P.handle, P.corner])].filter(vis); const h = r.intersectObjects(objs, false)[0]; return h ? { p: h.object.userData.pick, d: h.distance, uv: h.uv } : null; }
 function setHover(p) { sess.hover(p?.type === 'session' ? p.id : null); memory.hoverStar(p?.type === 'memory' ? p.id : null); }
 
 // manettes
 const ctrls = [0, 1].map((i) => { const c = renderer.xr.getController(i); scene.add(c);
   const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]), new THREE.LineBasicMaterial({ color: 0x9db4ff, transparent: true, opacity: 0.7 })); line.scale.z = 3; c.add(line);
   c.userData = { line }; c.addEventListener('connected', (e) => { c.userData.src = e.data; });
-  c.addEventListener('selectend', () => { if (drag?.src === c) endDrag(); });
-  c.addEventListener('selectstart', () => { rayFrom(c); const h = pick(ray); if (h && (h.p.type === 'handle' || h.p.type === 'corner')) startDrag(h.p, h.d, c); else act(h?.p, h?.uv); });
+  c.addEventListener('selectend', () => { if (drag?.src === c) endDrag(); if (boardSrc === c) { boardSrc = null; board.release(); } if (roomDrag?.src === c) endRoomDrag(); });
+  c.addEventListener('selectstart', () => { rayFrom(c); const h = pick(ray); if (h?.p && (h.p.type === 'handle' || h.p.type === 'corner')) startDrag(h.p, h.d, c); else if (h?.p?.type === 'dev' && h.p.name === 'board') boardPress(h.uv, c); else if (h?.p?.type === 'roomobj') startRoomDrag(h.p.name, h.d, c); else act(h?.p, h?.uv); });
   c.addEventListener('squeezestart', startRec); c.addEventListener('squeezeend', stopRec); return c; });
 // souris (mode bureau)
 const mouse = new THREE.Vector2(); let down = null, mouseHover = false;
 renderer.domElement.addEventListener('pointermove', (e) => { mouse.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1); mouseHover = true; });
-renderer.domElement.addEventListener('pointerdown', (e) => { down = [e.clientX, e.clientY]; mouse.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1); ray.setFromCamera(mouse, camera); const h = pick(ray); if (h && (h.p.type === 'handle' || h.p.type === 'corner')) { startDrag(h.p, h.d, 'mouse'); down = null; } });
+renderer.domElement.addEventListener('pointerdown', (e) => { down = [e.clientX, e.clientY]; mouse.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1); ray.setFromCamera(mouse, camera); const h = pick(ray); if (h?.p && (h.p.type === 'handle' || h.p.type === 'corner')) { startDrag(h.p, h.d, 'mouse'); down = null; } });
+renderer.domElement.addEventListener('pointerdown', (e) => { ray.setFromCamera(mouse, camera); const h = pick(ray); if (h?.p?.type === 'dev' && h.p.name === 'board') { controls.enabled = false; boardPress(h.uv, 'mouse'); } else if (h?.p?.type === 'roomobj') startRoomDrag(h.p.name, h.d, 'mouse'); });
+addEventListener('pointerup', () => { if (roomDrag?.src === 'mouse') endRoomDrag(); if (boardSrc === 'mouse') { boardSrc = null; board.release(); controls.enabled = true; } });
 renderer.domElement.addEventListener('pointerup', (e) => { if (drag) { endDrag(); return; } if (down && Math.hypot(e.clientX - down[0], e.clientY - down[1]) < 5) { ray.setFromCamera(mouse, camera); const h = pick(ray); act(h?.p, h?.uv); } down = null; });
 
-renderer.domElement.addEventListener('wheel', (e) => { if (convo.mesh.visible) convo.scrollBy(-e.deltaY); }, { passive: true });
+renderer.domElement.addEventListener('wheel', (e) => { if (memory.expanded && scrollTarget !== reader) memory.nudge(0, e.deltaY * 0.002); else scrollTarget.scrollBy(-e.deltaY); }, { passive: true });
 
 // ---- chat LLM (streaming)
 async function ask(text) {
@@ -282,7 +413,8 @@ async function stopRec() {
     log.push('🗣 ' + text.slice(0, 55));
     if (renaming) { finishRename(text); return; } // la dictée sert de nouveau nom
     if (launcher.open && launcher.step === 2) { launcher.prompt = text; launcher.draw(); return; } // la dictée sert de consigne de départ
-    const target = sess.selected && sess.sessions.get(sess.selected); if (controllable(target)) instruct(target, text); else ask(text);
+    if (memory.expanded) { memSearch(text); return; } // en mode mémoire, la voix cherche
+    const target = dictSession(); if (controllable(target)) instruct(target, text); else ask(text);
   } catch (e) { log.setChat('Erreur dictée : ' + e.message); }
 }
 addEventListener('keydown', (e) => { if (e.code === 'Space' && e.target === document.body && !rec) { e.preventDefault(); startRec(); } });
@@ -300,10 +432,10 @@ renderer.setAnimationLoop(() => { try {
   let hit = null;
   ctrls.forEach((c) => { const l = c.userData.line; l.scale.z = 3; if (!c.visible) return; rayFrom(c); const h = pick(ray); if (h) { l.scale.z = h.d; if (!hit) hit = h.p; } });
   if (!hit && mouseHover && !renderer.xr.isPresenting) { ray.setFromCamera(mouse, camera); hit = pick(ray)?.p ?? null; }
-  setHover(hit);
-  if (renderer.xr.isPresenting && convo.mesh.visible) for (const src of renderer.xr.getSession().inputSources) { const ax = src.gamepad?.axes, y = ax ? (ax[3] ?? ax[1] ?? 0) : 0; if (Math.abs(y) > 0.2) convo.scrollBy(-y * dt * 700); }
-  controls.enableZoom = !convo.mesh.visible;
-  updateDrag(dt); updateBar(); env.update(dt); sess.update(dt, now); memory.update(dt, now);
+  setHover(hit); scrollTarget = hit?.type === 'convo' ? (pinned.find((P) => P.id === hit.id)?.convo ?? convo) : hit?.type === 'reader' ? reader : hit?.type === 'dev' && hit.name !== 'board' ? devPanels[hit.name].impl : hit?.type === 'unpin' ? scrollTarget : convo;
+  if (renderer.xr.isPresenting && (scrollTarget.mesh.visible || pinned.length || memory.expanded)) for (const src of renderer.xr.getSession().inputSources) { const ax = src.gamepad?.axes, y = ax ? (ax[3] ?? ax[1] ?? 0) : 0; if (memory.expanded && scrollTarget !== reader) { const x = ax ? (ax[2] ?? ax[0] ?? 0) : 0; if (Math.abs(x) > 0.2) memory.nudge(-x * dt * 1.2, 0); if (Math.abs(y) > 0.2) memory.nudge(0, y * dt * 1.5); } else if (Math.abs(y) > 0.2) scrollTarget.scrollBy(-y * dt * 700); }
+  controls.enableZoom = !convo.mesh.visible && !pinned.length && !memory.expanded;
+  updateDrag(dt); updateBar(); updateDev(); updateRoom(); updateRoomDrag(dt); if (room.group.visible) room.update(dt); boardMove(); env.update(dt); sess.update(dt, now); memory.update(dt, now);
   sess.sessions.forEach((s, id) => { if (now - s.seen > 1800000) { sess.remove(id); refocus(); } });
   if (now - lastFocus > 1000) { lastFocus = now; refocus(); }
   renderer.render(scene, camera);

@@ -51,6 +51,54 @@ node client/runner.js                               # à laisser tourner (termin
 
 Le lanceur n'ouvre que les dossiers que tu as listés, jamais ailleurs. Les permissions de la session passent par les boutons Autoriser / Refuser du casque ; sans réponse, une session sans terminal les refuse. Lancements, consignes et fin de session sont consignés dans `data/audit.log`. Comme les autres fonctions de pilotage, cela donne à quiconque détient le jeton un moyen d'exécuter des commandes sur la machine : garde-le secret et n'utilise que le HTTPS.
 
+## Décors et fenêtres
+
+- **Décor** : le bouton `🌌 Décor` fait défiler les environnements (cosmos, aurore, salle blanche). Un environnement est un module `public/env-*.js` à ajouter à `ENVIRONMENTS` dans `public/env.js`.
+- **Panneaux** : sessions, mémoire, console, conversations sont des panneaux qu'on déplace et redimensionne (poignée et coin). La disposition est gardée dans le navigateur du casque (`localStorage`, clé `questlab.layout`).
+- **Conversations multiples** : `Épingler` détache la conversation de la session choisie dans sa propre fenêtre ; `✕` la ferme. On peut en épingler plusieurs, la dictée va à la session touchée en dernier.
+- **Capture** : `📷 Capture` envoie une image de la vue au bridge (`data/shot.png`, une seule, écrasée), pour que Claude voie ce que tu vois.
+
+## Mémoire
+
+Dans le mode mémoire, chaque projet est un amas d'étoiles.
+
+- **Naviguer** : touche une étiquette d'amas pour s'en rapprocher ; le bouton de remise à zéro rend la vue d'ensemble.
+- **Lire** : touche une étoile pour afficher le texte complet du souvenir en Markdown, défilable.
+- **Chercher** : la recherche vocale ou texte filtre les étoiles (tous les mots, sans tenir compte des accents) et estompe les autres.
+
+## Atelier de développement
+
+Le bouton `🛠 Atelier` ouvre des panneaux alimentés par la session sélectionnée (nécessite `--history`) :
+
+| Panneau | Contenu |
+|---|---|
+| Changements | fichiers modifiés par la session (Edit / Write), avec un extrait du diff |
+| Sortie | dernières commandes et leur résultat (secrets masqués) |
+| Tâches | liste `TodoWrite` en kanban (à faire / en cours / fait) |
+| Tableau | schémas envoyés par Claude, et dessin à main levée |
+
+- **Schémas** : Claude affiche une architecture avec `node client/diagram.js <session> '{"title":"…","nodes":[{"id":"api","label":"API"},{"id":"db","label":"Base"}],"links":[{"from":"api","to":"db","label":"SQL"}]}'`. La mise en page est automatique, par couches.
+- **Dessin** : dessine au contrôleur sur le tableau ; l'image est envoyée à la session sous la forme `[[board:<id>]]`, que le hook et l'écouteur remplacent par un PNG téléchargé dans `~/.quest-lab/boards/` (les 10 derniers sont gardés).
+
+## Salle blanche
+
+Chaque session a sa **salle** : une scène 3D devant toi, que Claude remplit pour expliquer ou maquetter une architecture.
+
+```bash
+node client/room.js <session> add '{"name":"api","shape":"api","pos":[0,1.4,-1.2],"label":"API","state":"ok"}'
+node client/room.js <session> add '{"shape":"link","from":"api","toName":"db","label":"SQL","state":"ok"}'
+node client/room.js <session> list      # renvoie aussi les positions déplacées par l'utilisateur
+node client/room.js <session> remove api
+node client/room.js <session> clear
+```
+
+- **Formes** : `box`, `sphere`, `cylinder`, `plane`, `text`, `arrow`, et pour le développement `db`, `api`, `server`, `queue`, `cache`, `browser`, `user`, `file`, `cloud`.
+- **Liens** : `{"shape":"link","from":"a","toName":"b"}`, animés ; `state` vaut `ok`, `warn`, `error` ou `idle`.
+- Positions en mètres, l'utilisateur est en `0,0,0` et regarde vers `-z`. 60 objets au plus par salle. Sans `pos`, `room.js` range les nœuds en ligne.
+- L'utilisateur peut saisir et déplacer un objet au contrôleur ; sa flèche suit.
+- **Persistance** : les salles sont écrites dans `data/rooms/<session>.json`, survivent aux redémarrages du bridge, et sont supprimées à la fin de la session ou après 30 jours. Les conversations, historiques et tableaux restent en mémoire seulement.
+- **Isolation** : chaque salle est rangée par session, mais tous les détenteurs du jeton voient toutes les salles : ce n'est pas une frontière de sécurité.
+
 ## Déployer
 
 Voir [DEPLOY.md](DEPLOY.md) et `./deploy.sh`.

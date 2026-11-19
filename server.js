@@ -78,6 +78,17 @@ const EVENTS = new Set(['agent.status', 'agent.remove', 'agent.message']); // le
 
 // ---- pilotage : permissions à valider et consignes à livrer (uniquement pour les machines installées avec --control)
 const asks = new Map();    // rid -> { id, machine, tool, res, timer }
+const dev = new Map();     // id de session -> { changes, output, todos } : données d'atelier, en mémoire seulement (comme l'historique)
+const rooms = new Map();   // id de session -> { objects: Map(nom -> objet), rev } : salle blanche de la session, gardée sur disque (data/rooms) pour survivre aux redéploiements
+const ROOMS_DIR = path.join(DATA_DIR, 'rooms'); fs.mkdirSync(ROOMS_DIR, { recursive: true });
+const roomFile = (id) => path.join(ROOMS_DIR, safe(id) + '.json'), roomTimers = new Map();
+for (const f of fs.readdirSync(ROOMS_DIR).filter((x) => x.endsWith('.json'))) { // rechargement au démarrage ; une salle abandonnée depuis 30 jours est supprimée
+  try { const p = path.join(ROOMS_DIR, f); if (Date.now() - fs.statSync(p).mtimeMs > 30 * 864e5) { fs.rmSync(p); continue; } const j = JSON.parse(fs.readFileSync(p, 'utf8')); rooms.set(String(j.id), { objects: new Map((j.objects || []).map((o) => [o.name, o])), rev: 0 }); } catch {}
+}
+function writeRoom(id) { const R = rooms.get(id); if (!R) return; const tmp = roomFile(id) + '.tmp'; try { fs.writeFileSync(tmp, JSON.stringify({ id, objects: [...R.objects.values()] })); fs.renameSync(tmp, roomFile(id)); } catch {} }
+function saveRoom(id) { clearTimeout(roomTimers.get(id)); roomTimers.set(id, setTimeout(() => { roomTimers.delete(id); writeRoom(id); }, 300)); }
+const flushRooms = () => { for (const id of roomTimers.keys()) { clearTimeout(roomTimers.get(id)); writeRoom(id); } roomTimers.clear(); };
+const boards = new Map();  // id de session -> PNG du dernier schéma dessiné dans le casque (mémoire seulement)
 const queues = new Map();  // id de session -> [{ text, at }]
 const transcripts = new Map(); // id de session -> { messages, at } : en mémoire seulement, jamais sur disque
 const waiters = new Map();       // id -> [{ res, timer }] : écouteurs en attente (long-poll)
@@ -112,6 +123,16 @@ function endAsk(rid, decision, why) {
   emit({ type: 'agent.ask.done', id: a.id, rid, decision });
 }
 
+// met une consigne en file pour une session (ou l'écrit au lanceur) ; renvoie le code HTTP
+function instructCore(id, text) {
+  if (!text || !state[id]?.control) return 404;
+  const q = queues.get(id) ?? []; if (q.length >= 5) return 429;
+  q.push({ text, at: Date.now() }); queues.set(id, q);
+  const rs = runnerSessions.get(id); // session lancée depuis le casque : on écrit directement dans son entrée
+  if (rs && runnerPush(rs.machine, { type: 'say', sid: rs.sid, text })) { audit(`consigne envoyée au lanceur machine=${rs.machine} session=${id} texte=${JSON.stringify(text)}`); emit({ type: 'agent.instruct', id, text, status: 'delivered' }); return 204; }
+  audit(`consigne en attente machine=${state[id].machine} session=${id} texte=${JSON.stringify(text)}`);
+  emit({ type: 'agent.instruct', id, text, status: 'queued' }); wake(id); return 204;
+}
 async function handle(req, res) {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/health') { res.writeHead(200).end('ok'); return; }
@@ -134,7 +155,7 @@ async function handle(req, res) {
     if (out.id && out.label) { autoLabels.set(out.id, out.label); out.auto = out.label; if (names[out.id]) out.label = names[out.id]; } // le nom choisi l'emporte sur celui du dossier
     for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
     emit(out);
-    if (e.type === 'agent.remove') { if (names[out.id]) { delete names[out.id]; saveNames(); } autoLabels.delete(out.id); runnerSessions.delete(out.id); queues.delete(out.id); transcripts.delete(out.id); clearTimeout(listening.get(out.id)); listening.delete(out.id); for (const [rid, a] of asks) if (a.id === out.id) endAsk(rid, 'pass', 'fin de session'); }
+    if (e.type === 'agent.remove') { if (names[out.id]) { delete names[out.id]; saveNames(); } autoLabels.delete(out.id); runnerSessions.delete(out.id); queues.delete(out.id); transcripts.delete(out.id); dev.delete(out.id); boards.delete(out.id); rooms.delete(out.id); clearTimeout(roomTimers.get(out.id)); roomTimers.delete(out.id); fs.rmSync(roomFile(out.id), { force: true }); clearTimeout(listening.get(out.id)); listening.delete(out.id); for (const [rid, a] of asks) if (a.id === out.id) endAsk(rid, 'pass', 'fin de session'); }
     if (e.inbox === true && e.control === true && queues.get(out.id)?.length) { // livre les consignes en attente à la session
       const texts = takeQueue(out.id); if (texts.length) return json(res, 200, { inbox: texts });
     }
@@ -213,25 +234,69 @@ async function handle(req, res) {
     endAsk(b.rid, b.decision, 'décidé'); return void res.writeHead(204).end();
   }
   if (P === '/api/instruct' && POST) { // depuis le casque : consigne pour une session
-    const b = JSON.parse(await readBody(req, 4096)), id = clip(String(b.id || ''), 80), text = clip(String(b.text || '').trim(), 500);
-    if (!text || !state[id]?.control) return void res.writeHead(404).end('session non pilotable');
-    const q = queues.get(id) ?? []; if (q.length >= 5) return void res.writeHead(429).end('trop de consignes en attente');
-    q.push({ text, at: Date.now() }); queues.set(id, q);
-    const rs = runnerSessions.get(id); // session lancée depuis le casque : on écrit directement dans son entrée
-    if (rs && runnerPush(rs.machine, { type: 'say', sid: rs.sid, text })) { audit(`consigne envoyée au lanceur machine=${rs.machine} session=${id} texte=${JSON.stringify(text)}`); emit({ type: 'agent.instruct', id, text, status: 'delivered' }); return void res.writeHead(204).end(); }
-    audit(`consigne en attente machine=${state[id].machine} session=${id} texte=${JSON.stringify(text)}`);
-    emit({ type: 'agent.instruct', id, text, status: 'queued' }); wake(id); return void res.writeHead(204).end();
+    const b = JSON.parse(await readBody(req, 4096)); return void res.writeHead(instructCore(clip(String(b.id || ''), 80), clip(String(b.text || '').trim(), 500))).end();
   }
+  if (P === '/api/dev' && POST) { // une machine envoie un événement d'atelier (changement, sortie, tâches) : opt-in avec --history
+    const b = JSON.parse(await readBody(req, 512 * 1024)), id = clip(String(b.id || ''), 80); if (!id || !state[id]) return void res.writeHead(404).end();
+    const d = dev.get(id) ?? { changes: [], output: [], todos: null }; dev.set(id, d); const t = Date.now();
+    if (b.kind === 'change') { d.changes.push({ t, tool: clip(String(b.tool || ''), 20), file: clip(String(b.file || ''), 200), diff: clip(String(b.diff || ''), 2400) }); d.changes = d.changes.slice(-60); }
+    else if (b.kind === 'output') { d.output.push({ t, cmd: clip(String(b.cmd || ''), 300), out: clip(String(b.out || ''), 2400), error: !!b.error }); d.output = d.output.slice(-40); }
+    else if (b.kind === 'diagram') { // schéma (nœuds + liens) affiché dans le Tableau du casque
+      const nodes = (Array.isArray(b.nodes) ? b.nodes : []).slice(0, 30).map((n) => ({ id: clip(String(n.id ?? n.label ?? ''), 30), label: clip(String(n.label ?? n.id ?? ''), 40), color: /^#[0-9a-fA-F]{6}$/.test(n.color) ? n.color : '' })).filter((n) => n.id);
+      const ids = new Set(nodes.map((n) => n.id)), links = (Array.isArray(b.links) ? b.links : []).slice(0, 60).map((l) => ({ from: clip(String(l.from ?? ''), 30), to: clip(String(l.to ?? ''), 30), label: clip(String(l.label ?? ''), 30) })).filter((l) => ids.has(l.from) && ids.has(l.to));
+      d.diagram = { title: clip(String(b.title || ''), 60), nodes, links, t };
+    }
+    else if (b.kind === 'sync') { // recalage complet depuis la transcription
+      const ok = (x) => Array.isArray(x) ? x : [];
+      d.changes = ok(b.changes).slice(-60).map((x) => ({ t: +x.t || t, tool: clip(String(x.tool || ''), 20), file: clip(String(x.file || ''), 200), diff: clip(String(x.diff || ''), 2400) }));
+      d.output = ok(b.output).slice(-40).map((x) => ({ t: +x.t || t, cmd: clip(String(x.cmd || ''), 300), out: clip(String(x.out || ''), 2400), error: !!x.error }));
+      d.todos = Array.isArray(b.todos) ? b.todos.slice(0, 60).map((x) => ({ content: clip(String(x.content || x.subject || ''), 160), status: ['pending', 'in_progress', 'completed'].includes(x.status) ? x.status : 'pending' })) : d.todos;
+    }
+    else if (b.kind === 'todos' && Array.isArray(b.todos)) d.todos = b.todos.slice(0, 60).map((x) => ({ content: clip(String(x.content || x.subject || ''), 160), status: ['pending', 'in_progress', 'completed'].includes(x.status) ? x.status : 'pending' }));
+    else return void res.writeHead(400).end();
+    emit({ type: 'agent.dev', id, kind: b.kind }); return void res.writeHead(204).end();
+  }
+  if (P === '/api/dev') return json(res, 200, dev.get(clip(String(url.searchParams.get('id') || ''), 80)) ?? { changes: [], output: [], todos: null });
+  if (P === '/api/room' && POST) { // salle blanche : Claude (client/room.js) ou le casque (déplacement) modifie les objets de la session
+    const b = JSON.parse(await readBody(req, 64 * 1024)), id = clip(String(b.id || ''), 80); if (!id || !state[id]) return void res.writeHead(404).end('session inconnue');
+    const R = rooms.get(id) ?? { objects: new Map(), rev: 0 }; rooms.set(id, R); const SHAPES = ['box', 'sphere', 'cylinder', 'plane', 'text', 'arrow', 'db', 'api', 'server', 'queue', 'cache', 'browser', 'user', 'file', 'cloud', 'link'];
+    const num = (v, d) => (Number.isFinite(+v) && v !== null && v !== '' ? Math.max(-100, Math.min(100, +v)) : d), vec = (a, d) => (Array.isArray(a) ? [0, 1, 2].map((i) => num(a[i], d[i])) : d);
+    const clean = (o, old = {}) => ({ name: safe(o.name ?? old.name).slice(0, 40), shape: SHAPES.includes(o.shape) ? o.shape : (old.shape ?? 'box'), state: ['ok', 'warn', 'error', 'idle'].includes(o.state) ? o.state : (old.state ?? 'ok'),
+      from: safe(o.from ?? old.from ?? '').slice(0, 40), toName: safe(typeof o.to === 'string' ? o.to : (o.toName ?? o.target ?? old.toName ?? '')).slice(0, 40),
+      color: /^#[0-9a-fA-F]{6}$/.test(o.color) || /^[a-z]{3,20}$/.test(o.color) ? o.color : (old.color ?? '#4f8cff'), pos: vec(o.pos, old.pos ?? [0, 1.2, -1]),
+      size: Array.isArray(o.size) ? vec(o.size, [0.3, 0.3, 0.3]).map((x) => Math.max(0.01, Math.abs(x))) : Number.isFinite(+o.size) && o.size !== null ? Math.max(0.01, Math.min(20, +o.size)) : (old.size ?? 0.3),
+      rot: vec(o.rot, old.rot ?? [0, 0, 0]), to: Array.isArray(o.to) ? vec(o.to, [0, 1, -2]) : old.to, text: clip(String(o.text ?? old.text ?? ''), 120), label: clip(String(o.label ?? old.label ?? ''), 60) });
+    if (b.op === 'set' && b.obj) { const o = clean(b.obj, R.objects.get(safe(b.obj.name))); if (!R.objects.has(o.name) && R.objects.size >= 60) return void res.writeHead(429).end('60 objets au maximum'); R.objects.set(o.name, o); }
+    else if (b.op === 'remove') R.objects.delete(safe(b.name));
+    else if (b.op === 'clear') R.objects.clear();
+    else if (b.op === 'move') { const o = R.objects.get(safe(b.name)); if (!o) return void res.writeHead(404).end('objet inconnu'); const old = o.pos; o.pos = vec(b.pos, o.pos); if (o.to) o.to = o.to.map((v, i) => Math.max(-100, Math.min(100, v + o.pos[i] - old[i]))); /* une flèche se déplace d'un bloc : son extrémité suit */ if (b.size !== undefined) o.size = clean({ size: b.size }, o).size; }
+    else return void res.writeHead(400).end('op inconnue');
+    R.rev++; saveRoom(id); emit({ type: 'agent.room', id }); return void res.writeHead(204).end();
+  }
+  if (P === '/api/room') { const R = rooms.get(clip(String(url.searchParams.get('id') || ''), 80)); return json(res, 200, { rev: R?.rev ?? 0, objects: R ? [...R.objects.values()] : [] }); }
+  if (P === '/api/board' && POST) { // schéma dessiné dans le casque : gardé en mémoire, la session le récupère via [[board:id]]
+    const id = clip(String(url.searchParams.get('id') || ''), 80); if (!state[id]?.control) return void res.writeHead(404).end('session non pilotable');
+    const chunks = []; let n = 0; for await (const c of req) { n += c.length; if (n > 4e6) throw new Error('image trop grosse'); chunks.push(c); }
+    const buf = Buffer.concat(chunks); if (buf.length < 8 || buf.readUInt32BE(0) !== 0x89504e47) return void res.writeHead(400).end('PNG attendu');
+    boards.set(id, buf); audit(`schéma reçu machine=${state[id].machine} session=${id} octets=${buf.length}`);
+    return void res.writeHead(instructCore(id, `Schéma dessiné dans le casque (image) : [[board:${id}]]`)).end();
+  }
+  if (P === '/api/board') { const buf = boards.get(clip(String(url.searchParams.get('id') || ''), 80)); if (!buf) return void res.writeHead(404).end(); return void res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' }).end(buf); }
   if (P === '/api/memory/push' && POST) { // une machine envoie sa mémoire
-    const b = JSON.parse(await readBody(req, 4 * 1024 * 1024)); const machine = safe(b.machine);
+    const b = JSON.parse(await readBody(req, 12 * 1024 * 1024)); const machine = safe(b.machine);
     const list = (Array.isArray(b.memories) ? b.memories : []).slice(0, 2000).map((m) => ({ project: clip(String(m.project), 60), file: clip(String(m.file), 100), name: clip(String(m.name), 120), description: clip(String(m.description || ''), 300),
-      type: clip(String(m.type || 'project'), 20), body: clip(String(m.body || ''), 700), size: +m.size || 0, links: (m.links || []).slice(0, 30).map((l) => clip(String(l), 100)) }));
+      type: clip(String(m.type || 'project'), 20), body: clip(String(m.body || ''), 3000), size: +m.size || 0, links: (m.links || []).slice(0, 30).map((l) => clip(String(l), 100)) }));
     fs.writeFileSync(path.join(DATA_DIR, 'memory', `${machine}.json`), JSON.stringify({ machine, at: Date.now(), list })); return void res.writeHead(204).end();
   }
   if (P === '/api/memory') return json(res, 200, { memories: allMemories() });
   if (P === '/api/clientlog' && POST) { // diagnostic casque
     const line = `[client ${new Date().toISOString().slice(11, 19)}] ${(await readBody(req, 4096)).replace(/\n/g, ' ⏎ ')}`;
     console.log(line); fs.appendFileSync(path.join(DATA_DIR, 'client.log'), line + '\n'); return void res.writeHead(204).end();
+  }
+  if (P === '/api/shot' && POST) { // capture d'écran du casque (PNG), une seule gardée et écrasée à chaque envoi : data/shot.png
+    const chunks = []; let n = 0; for await (const c of req) { n += c.length; if (n > 8e6) throw new Error('image trop grosse'); chunks.push(c); }
+    const buf = Buffer.concat(chunks); if (buf.length < 8 || buf.readUInt32BE(0) !== 0x89504e47) return void res.writeHead(400).end('PNG attendu');
+    fs.writeFileSync(path.join(DATA_DIR, 'shot.png'), buf); return void res.writeHead(204).end();
   }
   if (P === '/api/stt' && POST) { // WAV brut -> transcription (Jetson)
     if (!STT_URL || !SCRIBE_DICTEE_TOKEN) return void res.writeHead(503).end('STT_URL / SCRIBE_DICTEE_TOKEN absents de .env');
@@ -260,7 +325,7 @@ async function handle(req, res) {
 
 http.createServer((req, res) => handle(req, res).catch((e) => { console.error(e.message); if (!res.headersSent) res.writeHead(400).end('erreur'); else res.end(); }))
   .listen(PORT, HOST, () => console.log(`Quest Lab — ${HOST}:${PORT}\nAccès (ajoute à l'URL publique) : /?k=${TOKEN}\nLLM : ${LLM_BASE_URL ? 'configuré' : 'non configuré'}`));
-process.on('SIGTERM', () => { fs.writeFileSync(STATE, JSON.stringify(state)); process.exit(0); });
+process.on('SIGTERM', () => { flushRooms(); fs.writeFileSync(STATE, JSON.stringify(state)); process.exit(0); });
 
 // Simulateur d'agents (SIMULATE=1 pour démo)
 if (SIMULATE === '1') {
