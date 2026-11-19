@@ -1,8 +1,10 @@
 import * as THREE from 'three';
 import { canvasTex, glowTexture } from './ui.js';
+import { buildAurore } from './env-aurore.js';
+import { buildSalle } from './env-salle.js';
 
 // Observatoire cosmique : ciel dégradé, étoiles, nébuleuses, plateforme circulaire à cadran, poussière.
-export function buildEnvironment(scene) {
+export function buildCosmos(scene) {
   scene.background = new THREE.Color(0x03040c);
   const root = new THREE.Group(); scene.add(root);
 
@@ -62,10 +64,14 @@ export function buildEnvironment(scene) {
   const dust = new THREE.Points(dg, new THREE.PointsMaterial({ size: 0.035, map: glowTexture(), color: 0x9fb4ff, transparent: true, opacity: 0.55, depthWrite: false, blending: THREE.AdditiveBlending }));
   root.add(dust);
 
-  scene.add(new THREE.HemisphereLight(0x8fa6ff, 0x1a1030, 0.9));
+  root.add(new THREE.HemisphereLight(0x8fa6ff, 0x1a1030, 0.9));
 
-  return { update(dt) {
+  return { dispose() { scene.remove(root); root.traverse((o) => { o.geometry?.dispose(); o.material?.dispose?.(); }); }, update(dt) {
     stars.rotation.y += dt * 0.004;
     const p = dg.attributes.position; for (let i = 0; i < N; i++) { let y = p.getY(i) + dt * 0.03; if (y > 3.2) y = 0; p.setY(i, y); } p.needsUpdate = true;
   } };
 }
+
+// décors disponibles ; le choix est mémorisé dans le navigateur du casque
+export const ENVIRONMENTS = [['cosmos', 'Cosmos', buildCosmos], ['aurore', 'Aurore', buildAurore], ['salle', 'Salle blanche', buildSalle]];
+export function buildEnvironment(scene, name) { return (ENVIRONMENTS.find((e) => e[0] === name) || ENVIRONMENTS[0])[2](scene); }

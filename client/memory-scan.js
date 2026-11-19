@@ -15,7 +15,7 @@ export function loadMemories(root = path.join(os.homedir(), '.claude', 'projects
       const get = (k) => (fm.match(new RegExp('^\\s*' + k + ':\\s*(.*)$', 'm')) || [])[1]?.trim().replace(/^"(.*)"$/, '$1') || '';
       const file = f.replace(/\.md$/, '');
       out.push({ project, file, name: get('name') || file, description: get('description'), type: get('type') || 'project',
-        body: body.slice(0, 700), size: body.length, links: [...body.matchAll(/\[\[([^\]]+)\]\]/g)].map((x) => x[1]) });
+        body: body.slice(0, 3000), size: body.length, links: [...body.matchAll(/\[\[([^\]]+)\]\]/g)].map((x) => x[1]) });
     }
   }
   return out;
