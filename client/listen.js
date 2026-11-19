@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { resolveBoards } from './board.js';
 
 const id = process.argv[2];
 if (!id) { console.error('usage : node listen.js <id-de-session>'); process.exit(1); }
@@ -17,6 +18,6 @@ for (;;) {
     if (r.status === 404) process.exit(0); // session inconnue ou terminée : on arrête
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const { texts = [] } = await r.json(); fails = 0;
-    for (const t of texts) console.log(`[Quest Lab] Consigne dictée par l'utilisateur dans son casque : ${t.replace(/\s+/g, ' ')}`);
+    for (const t0 of texts) { const t = await resolveBoards(t0, BASE, TOKEN); console.log(`[Quest Lab] Consigne dictée par l'utilisateur dans son casque : ${t.replace(/\s+/g, ' ')}`); }
   } catch { await new Promise((ok) => setTimeout(ok, Math.min(30000, 1000 * 2 ** Math.min(fails++, 5)))); }
 }
