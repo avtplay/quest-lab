@@ -8,6 +8,8 @@ import { createMemory } from './memory.js';
 import { createConvo } from './convo.js';
 import { createReader } from './reader.js';
 import { createList, createKanban, createBoard } from './dev.js';
+import { createWeb } from './web.js';
+import { createVoice } from './voice.js';
 import { createRoom } from './room3d.js';
 
 const clog = (m) => { try { fetch('/api/clientlog', { method: 'POST', body: String(m).slice(0, 1500), keepalive: true }); } catch {} };
@@ -32,6 +34,8 @@ const reader = createReader(); const readerGroup = new THREE.Group(); readerGrou
 const convo = createConvo(); const convoGroup = new THREE.Group(); convoGroup.position.set(0, 1.55, -1.35); convoGroup.rotation.order = 'YXZ'; convo.mesh.position.set(0, 0, 0); convoGroup.add(convo.mesh); scene.add(convoGroup);
 let lastSel = null, renaming = null; // renaming : id de la session dont on dicte le nouveau nom
 async function loadTranscript(id) { try { const r = await fetch('/api/transcript?id=' + encodeURIComponent(id)); if (!r.ok) return; const m = (await r.json()).messages;
+  const last = m.at(-1), sig = last?.role === 'assistant' ? m.length + ':' + last.text.length + ':' + last.text.slice(0, 40) : null; // lit la nouvelle réponse d'une session, pas l'historique à l'ouverture
+  if (spoken.has(id) && sig && sig !== spoken.get(id)) voice.speak(last.text); spoken.set(id, sig);
   if (sess.selected === id) convo.setMessages(m); pinned.forEach((P) => { if (P.id === id) P.convo.setMessages(m); }); } catch {} }
 // conversations épinglées : plusieurs fenêtres en même temps (max 4), chacune suit sa session
 const PIN_KEY = 'questlab.pins', MAX_PINS = 4, pinned = []; let dictId = null; // dictId : session visée par la voix quand on a touché une fenêtre épinglée
@@ -88,6 +92,17 @@ const envBtn = smallButton('🌌 Décor', { type: 'next-env' }, 0.66, -0.55);
 const shotBtn = smallButton('📷 Capture', { type: 'shot' }, 0, -0.55);
 const devBtn = smallButton('🛠 Atelier', { type: 'toggle-dev' }, -0.33, -0.55);
 const launchBtn = smallButton('+ Session', { type: 'open-launcher' }, -0.66, -0.55);
+// horloge sous la console : l'heure locale du casque, mise à jour à chaque minute
+const wallClock = (() => { const { g, t } = canvasTex(512, 160), m = new THREE.Mesh(new THREE.PlaneGeometry(0.34, 0.106), new THREE.MeshBasicMaterial({ map: t, transparent: true, toneMapped: false })); m.position.set(0, -0.69, 0.031); consoleGroup.add(m); let key = '';
+  return { update() { const d = new Date(), k = d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }); if (k === key) return; key = k; g.clearRect(0, 0, 512, 160);
+    g.fillStyle = 'rgba(14,18,42,.94)'; g.beginPath(); g.roundRect(4, 4, 504, 152, 44); g.fill(); g.strokeStyle = 'rgba(120,150,255,.6)'; g.lineWidth = 4; g.stroke();
+    g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = '#eef2ff'; g.font = '700 84px system-ui'; g.fillText(k, 256, 70);
+    g.fillStyle = '#8c98c4'; g.font = '30px system-ui'; g.fillText(d.toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' }), 256, 128); t.needsUpdate = true; } }; })();
+const voice = createVoice(), voiceBtn = smallButton('🔊 Voix', { type: 'toggle-voice' }, 0.33, -0.55);
+function relabel(m, label) { const { g, t } = canvasTex(384, 128); g.fillStyle = 'rgba(14,18,42,.94)'; g.beginPath(); g.roundRect(4, 4, 376, 120, 40); g.fill(); g.strokeStyle = 'rgba(120,150,255,.6)'; g.lineWidth = 4; g.stroke();
+  g.fillStyle = '#dfe6ff'; g.font = '600 42px system-ui'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(label, 192, 66); t.needsUpdate = true; m.material.map?.dispose(); m.material.map = t; m.material.needsUpdate = true; }
+relabel(voiceBtn, voice.on ? '🔊 Voix : oui' : '🔇 Voix : non');
+const spoken = new Map(); // id de session -> signature du dernier message lu (le premier chargement ne lit rien)
 
 // ---- écrans déplaçables et redimensionnables, comme les fenêtres de l'OS du Quest
 // poignée au-dessus de l'écran : maintenir la gâchette pour le déplacer (stick avant/arrière : plus près / plus loin) ; coin en bas à droite : l'agrandir ou le réduire
@@ -135,11 +150,12 @@ function mkDev(name, impl, pos, sc) {
 }
 mkDev('changes', createList('changes'), [-1.3, 1.5, -1.0], 0.75); mkDev('output', createList('output'), [1.3, 1.5, -1.0], 0.75);
 mkDev('todos', createKanban(), [0, 2.3, -1.35], 0.8); const board = createBoard(); mkDev('board', board, [1.35, 0.8, -0.8], 0.7);
+const web = createWeb(); mkDev('web', web, [0, 1.25, -1.9], 1.15); // navigateur de dev de la session (lecture seule) : n'apparaît que si un flux existe
 async function loadDev(id) { devLoadedId = id; devLoadedAt = Date.now(); devDirty.delete(id); try { const r = await fetch('/api/dev?id=' + encodeURIComponent(id)); if (r.ok) devStore.set(id, await r.json()); } catch {} }
 function updateDev() {
-  const ds = dictSession(), show = devOn && !!ds && !memory.expanded; for (const P of Object.values(devPanels)) P.group.visible = show; if (!show) return;
+  const ds = dictSession(), show = devOn && !!ds && !memory.expanded; for (const P of Object.values(devPanels)) P.group.visible = show && (P !== devPanels.web || web.active); if (!show) return;
   if ((devLoadedId !== ds.id || devDirty.has(ds.id)) && Date.now() - devLoadedAt > 700) loadDev(ds.id);
-  const d = devStore.get(ds.id), now = Date.now(); if (!board.drawing) board.showDiagram(ds.id, d?.diagram); devPanels.changes.impl.draw(ds, d, now); devPanels.output.impl.draw(ds, d, now); devPanels.todos.impl.draw(ds, d);
+  const d = devStore.get(ds.id), now = Date.now(); if (!board.drawing) board.showDiagram(ds.id, d?.diagram); devPanels.changes.impl.draw(ds, d, now); devPanels.output.impl.draw(ds, d, now); devPanels.todos.impl.draw(ds, d); web.draw(ds);
 }
 async function sendBoard() {
   const ds = dictSession(); if (!ds || !controllable(ds)) { log.setChat('Le tableau s\'envoie à une session pilotable : sélectionne-en une.'); return; }
@@ -189,11 +205,12 @@ function updateDrag(dt) {
   } else if (ray.ray.intersectPlane(drag.plane, _p)) P.group.scale.setScalar(Math.min(2.5, Math.max(0.5, drag.s0 * _p.distanceTo(P.group.position) / drag.r0)));
 }
 // ---- lanceur : démarrer une nouvelle session Claude Code sur une machine (machine -> dossier -> consigne dictée -> lancer)
+const LAUNCH_MODELS = [['', 'Défaut'], ['sonnet', 'Sonnet'], ['opus', 'Opus'], ['haiku', 'Haiku']];
 const launcher = (() => {
   const W = 1536, H = 960, { g, t } = canvasTex(W, H);
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.75), new THREE.MeshBasicMaterial({ map: t, transparent: true, toneMapped: false }));
   mesh.position.set(0, 1.6, -1.05); mesh.visible = false; mesh.userData.pick = { type: 'launcher' }; scene.add(mesh);
-  const L = { mesh, open: false, step: 0, runners: [], machine: null, dir: null, prompt: '', status: '', rid: null, failed: false, buttons: [], pendingSelect: null };
+  const L = { mesh, open: false, step: 0, runners: [], machine: null, dir: null, prompt: '', model: '', status: '', rid: null, failed: false, buttons: [], pendingSelect: null };
   L.draw = () => {
     g.clearRect(0, 0, W, H); const bg = g.createLinearGradient(0, 0, 0, H); bg.addColorStop(0, 'rgba(22,28,64,.97)'); bg.addColorStop(1, 'rgba(9,12,30,.97)');
     g.fillStyle = bg; g.beginPath(); g.roundRect(0, 0, W, H, 44); g.fill(); g.lineWidth = 5; g.strokeStyle = 'rgba(142,162,255,.7)'; g.stroke();
@@ -206,15 +223,22 @@ const launcher = (() => {
     if (L.step === 0) { sub('Sur quelle machine ?');
       if (!online.length) { g.font = '32px system-ui'; g.fillStyle = '#ffd28a'; wrap(g, 'Aucun lanceur actif. Sur la machine voulue, démarre : node ~/.quest-lab/client/runner.js (après avoir autorisé des dossiers dans ~/.quest-lab/config.json).', 60, 260, W - 120, 46, 5); }
       online.slice(0, 8).forEach((r, i) => btn(60 + (i % 2) * 730, 210 + Math.floor(i / 2) * 130, 700, 110, r.machine, '#8fa6ff', { machine: r.machine }, `${r.dirs.length} dossier${r.dirs.length > 1 ? 's' : ''} autorisé${r.dirs.length > 1 ? 's' : ''}`));
-      btn(60, 800, 300, 100, 'Annuler', '#8d97c4', { close: true }); }
+      btn(60, 800, 300, 100, 'Annuler', '#8d97c4', { close: true });
+      if (L.runners.some((r) => r.on && r.resumable?.length)) btn(1016, 800, 460, 100, 'Reprendre une session', '#ffd28a', { resumeList: true }); }
+    else if (L.step === 4) { sub('Reprendre quelle session ?');
+      const rs = online.flatMap((r) => (r.resumable || []).map((x) => ({ ...x, machine: r.machine }))).sort((a, b) => b.at - a.at).slice(0, 6);
+      rs.forEach((x, i) => btn(60, 200 + i * 98, W - 120, 86, (x.title || x.sid.slice(0, 8)).slice(0, 52), '#8fa6ff', { resume: x.sid, machine: x.machine }, `${x.machine} · ${x.dir.split('/').filter(Boolean).pop()} · ${x.model || 'modèle par défaut'}`));
+      btn(60, 800, 300, 100, 'Retour', '#8d97c4', { back: true }); }
     else if (L.step === 1) { sub(`Dans quel dossier ? (${L.machine})`);
       (online.find((r) => r.machine === L.machine)?.dirs ?? []).slice(0, 8).forEach((d, i) => btn(60 + (i % 2) * 730, 210 + Math.floor(i / 2) * 130, 700, 110, d.split('/').filter(Boolean).pop() || d, '#8fa6ff', { dir: d }, d.length > 40 ? '…' + d.slice(-38) : d));
       btn(60, 800, 300, 100, 'Retour', '#8d97c4', { back: true }); }
     else if (L.step === 2) { sub(`${L.machine} · ${L.dir.split('/').filter(Boolean).pop()}`);
-      g.fillStyle = 'rgba(8,12,30,.9)'; g.beginPath(); g.roundRect(60, 190, W - 120, 440, 26); g.fill(); g.strokeStyle = 'rgba(142,162,255,.45)'; g.lineWidth = 3; g.stroke();
+      g.fillStyle = 'rgba(8,12,30,.9)'; g.beginPath(); g.roundRect(60, 190, W - 120, 400, 26); g.fill(); g.strokeStyle = 'rgba(142,162,255,.45)'; g.lineWidth = 3; g.stroke();
       if (L.prompt) { g.font = '40px system-ui'; g.fillStyle = '#f1e8d6'; wrap(g, L.prompt, 90, 260, W - 180, 54, 6); }
       else { g.font = '38px system-ui'; g.fillStyle = '#6f7aa5'; wrap(g, 'Maintiens le grip et dicte la consigne de départ. (Sur PC : tape-la dans le champ en bas puis Entrée.)', 90, 260, W - 180, 52, 4); }
-      g.font = '28px system-ui'; g.fillStyle = '#8c98c4'; wrap(g, 'La session pourra lancer des commandes dans ce dossier. Tu valides chaque permission avec Autoriser / Refuser.', 60, 680, W - 120, 36, 2);
+      g.font = '30px system-ui'; g.fillStyle = '#9fb0e0'; g.fillText('Modèle :', 60, 650);
+      LAUNCH_MODELS.forEach(([v, name], i) => btn(250 + i * 300, 610, 280, 64, name, L.model === v ? '#38e08f' : '#8fa6ff', { model: v }));
+      g.font = '26px system-ui'; g.fillStyle = '#8c98c4'; wrap(g, 'La session pourra lancer des commandes dans ce dossier. Tu valides chaque permission avec Autoriser / Refuser.', 60, 730, W - 120, 34, 2);
       btn(60, 800, 300, 100, 'Retour', '#8d97c4', { back: true }); btn(400, 800, 340, 100, 'Redicter', '#8d97c4', { redo: true });
       if (L.prompt) btn(1136, 800, 340, 100, 'Lancer', '#38e08f', { go: true }); }
     else { g.font = '44px system-ui'; g.fillStyle = L.failed ? '#ff8da0' : '#cdd6ff'; wrap(g, L.status, 60, 260, W - 120, 60, 6); btn(60, 800, 300, 100, 'Fermer', '#8d97c4', { close: true }); }
@@ -225,16 +249,16 @@ const launcher = (() => {
 async function openLauncher() { launcher.open = true; launcher.step = 0; launcher.machine = launcher.dir = null; launcher.prompt = ''; launcher.failed = false; launcher.mesh.visible = true; launcher.draw();
   try { launcher.runners = (await (await fetch('/api/runners')).json()).runners; } catch { launcher.runners = []; } launcher.draw(); }
 function closeLauncher() { launcher.open = false; launcher.mesh.visible = false; }
-async function launchSession() {
-  launcher.step = 3; launcher.failed = false; launcher.status = 'Envoi de la demande…'; launcher.draw();
-  try { const r = await fetch('/api/launch', { method: 'POST', body: JSON.stringify({ machine: launcher.machine, dir: launcher.dir, prompt: launcher.prompt }) });
+async function launchSession(resume, machine) {
+  if (machine) launcher.machine = machine; launcher.step = 3; launcher.failed = false; launcher.status = 'Envoi de la demande…'; launcher.draw();
+  try { const r = await fetch('/api/launch', { method: 'POST', body: JSON.stringify(resume ? { machine: launcher.machine, resume } : { machine: launcher.machine, dir: launcher.dir, prompt: launcher.prompt, model: launcher.model }) });
     if (!r.ok) { launcher.failed = true; launcher.status = `Refusé (${r.status}) : ${await r.text()}`; } else { launcher.rid = (await r.json()).rid; launcher.status = 'Demande envoyée. En attente du lanceur…'; } }
   catch (e) { launcher.failed = true; launcher.status = 'Erreur : ' + e.message; } launcher.draw();
 }
 function launcherClick(uv) {
   const x = (uv?.x ?? 0) * 1536, y = (1 - (uv?.y ?? 0)) * 960, b = launcher.buttons.find((k) => x >= k.x0 && x <= k.x1 && y >= k.y0 && y <= k.y1); if (!b) return; const A = b.action;
-  if (A.close) closeLauncher(); else if (A.machine) { launcher.machine = A.machine; launcher.step = 1; } else if (A.dir) { launcher.dir = A.dir; launcher.prompt = ''; launcher.step = 2; }
-  else if (A.back) launcher.step = Math.max(0, launcher.step - 1); else if (A.redo) launcher.prompt = ''; else if (A.go) return launchSession();
+  if (A.close) closeLauncher(); else if (A.machine) { launcher.machine = A.machine; launcher.step = 1; } else if (A.resumeList) launcher.step = 4; else if (A.resume) return launchSession(A.resume, A.machine); else if (A.dir) { launcher.dir = A.dir; launcher.prompt = ''; launcher.step = 2; }
+  else if ('model' in A) launcher.model = A.model; else if (A.back) launcher.step = launcher.step === 4 ? 0 : Math.max(0, launcher.step - 1); else if (A.redo) launcher.prompt = ''; else if (A.go) return launchSession();
   launcher.draw();
 }
 function onLaunchEvent(e) {
@@ -280,7 +304,7 @@ function onEvent(e) {
   if (e.type === 'agent.dev') devDirty.add(e.id);
   if (e.type === 'agent.room') roomDirty.add(e.id);
   if (e.type === 'agent.transcript' && (e.id === sess.selected || pinned.some((P) => P.id === e.id))) loadTranscript(e.id);
-  if (e.type === 'agent.ask') { const s = sess.sessions.get(e.id); if (s) { s.ask = { rid: e.rid, tool: e.tool, summary: e.summary }; s.status = 'waiting'; s.seen = e.t;
+  if (e.type === 'agent.ask') { const s = sess.sessions.get(e.id); if (s) { chime(); s.ask = { rid: e.rid, tool: e.tool, summary: e.summary }; s.status = 'waiting'; s.seen = e.t;
     memory.select(null); sess.select(e.id); log.push(`${s.name} demande : ${e.tool}`); refocus(); } }
   if (e.type === 'agent.ask.done') { const s = sess.sessions.get(e.id); if (s && s.ask?.rid === e.rid) { s.ask = null; s.status = e.decision === 'deny' ? 'idle' : 'working'; s.seen = e.t; log.push(`${s.name} : ${e.decision === 'allow' ? 'autorisé' : e.decision === 'deny' ? 'refusé' : 'laissé au terminal'}`); refocus(); } }
   if (e.type === 'agent.instruct') { const s = sess.sessions.get(e.id); if (s) { s.note = { text: e.text, status: e.status, until: Date.now() + (e.status === 'queued' ? 600000 : 8000) }; refocus(); } }
@@ -320,6 +344,8 @@ function act(p, uv) {
   if (p.type === 'reload') { location.reload(); return; }
   if (p.type === 'next-env') { env.dispose(); envName = ENVIRONMENTS[(ENVIRONMENTS.findIndex((e) => e[0] === envName) + 1) % ENVIRONMENTS.length][0]; try { localStorage.setItem('questlab.env', envName); } catch {} env = buildEnvironment(scene, envName); return; }
   if (p.type === 'shot') { captureShot(); return; }
+  if (p.type === 'toggle-voice') { const on = voice.toggle(); relabel(voiceBtn, on ? '🔊 Voix : oui' : '🔇 Voix : non'); if (!on) { log.setChat('Voix coupée.'); return; }
+    log.setChat('Voix activée… test.'); voice.speak('Voix activée.').then((ok) => log.setChat(ok ? 'Voix activée : les réponses sont lues à voix haute.' : 'Aucune voix disponible : ni le synthétiseur du bridge (client/tts_worker.py), ni celle du navigateur.')); return; }
   if (p.type === 'toggle-dev') { devOn = !devOn; try { localStorage.setItem('questlab.dev', devOn ? '1' : '0'); } catch {} log.setChat(devOn ? 'Atelier ouvert : Changements, Sortie, Tâches, Tableau (session sélectionnée).' : 'Atelier fermé.'); return; }
   if (p.type === 'open-launcher') { openLauncher(); return; }
   if (p.type === 'launcher') { launcherClick(uv); return; }
@@ -344,7 +370,7 @@ const vis = (o) => { for (; o; o = o.parent) if (!o.visible) return false; retur
 const ray = new THREE.Raycaster(); ray.far = 12;
 const tmpM = new THREE.Matrix4();
 function rayFrom(c) { c.updateMatrixWorld(true); tmpM.identity().extractRotation(c.matrixWorld); ray.ray.origin.setFromMatrixPosition(c.matrixWorld); ray.ray.direction.set(0, 0, -1).applyMatrix4(tmpM).normalize(); }
-function pick(r) { const objs = [...sess.pickables(), ...memory.pickables(), back, log.mesh, bar.m, memBar.m, reader.mesh, ...Object.values(devPanels).map((P) => P.impl.mesh), ...room.pickables(), convo.mesh, ...pinned.flatMap((P) => [P.convo.mesh, P.close]), reloadBtn, layoutBtn, envBtn, shotBtn, devBtn, launchBtn, launcher.mesh, ...Object.values(panels).flatMap((P) => [P.handle, P.corner])].filter(vis); const h = r.intersectObjects(objs, false)[0]; return h ? { p: h.object.userData.pick, d: h.distance, uv: h.uv } : null; }
+function pick(r) { const objs = [...sess.pickables(), ...memory.pickables(), back, log.mesh, bar.m, memBar.m, reader.mesh, ...Object.values(devPanels).map((P) => P.impl.mesh), ...room.pickables(), convo.mesh, ...pinned.flatMap((P) => [P.convo.mesh, P.close]), reloadBtn, layoutBtn, envBtn, shotBtn, devBtn, launchBtn, voiceBtn, launcher.mesh, ...Object.values(panels).flatMap((P) => [P.handle, P.corner])].filter(vis); const h = r.intersectObjects(objs, false)[0]; return h ? { p: h.object.userData.pick, d: h.distance, uv: h.uv } : null; }
 function setHover(p) { sess.hover(p?.type === 'session' ? p.id : null); memory.hoverStar(p?.type === 'memory' ? p.id : null); }
 
 // manettes
@@ -376,6 +402,7 @@ async function ask(text) {
       try { const d = JSON.parse(p.slice(5)).choices?.[0]?.delta ?? {};
         if (d.reasoning) { think += d.reasoning; if (!out) log.setChat('💭 ' + think); }
         if (d.content) { out += d.content; log.setChat(out); } } catch {} } }
+  if (out) voice.speak(out);
 }
 const q = document.getElementById('q'); const send = () => { if (!q.value.trim() && !renaming) return; if (renaming) { finishRename(q.value); q.value = ''; return; } if (launcher.open && launcher.step === 2) { launcher.prompt = q.value.trim(); launcher.draw(); } else ask(q.value); q.value = ''; };
 document.getElementById('send').onclick = send; q.onkeydown = (e) => e.key === 'Enter' && send();
@@ -426,14 +453,21 @@ let frames = 0, t0 = 0, errOnce = false;
 renderer.xr.addEventListener('sessionstart', () => { frames = 0; t0 = performance.now(); clog('XR sessionstart'); });
 renderer.xr.addEventListener('sessionend', () => clog('XR sessionend'));
 const clock = new THREE.Clock(); let lastFocus = 0;
-renderer.setAnimationLoop(() => { try {
+const keys = new Set(), flyP = new THREE.Vector3(), flyQ = new THREE.Quaternion(), flyS = new THREE.Vector3(), flyG = new THREE.Vector3();
+addEventListener('keydown', (e) => { if (!/^(INPUT|TEXTAREA)$/.test(e.target.tagName)) keys.add(e.code); }); addEventListener('keyup', (e) => keys.delete(e.code)); addEventListener('blur', () => keys.clear());
+renderer.setAnimationLoop(() => { try { wallClock.update();
   const dt = Math.min(clock.getDelta(), 0.1), now = Date.now();
   // survol : manettes en priorité, sinon souris
   let hit = null;
   ctrls.forEach((c) => { const l = c.userData.line; l.scale.z = 3; if (!c.visible) return; rayFrom(c); const h = pick(ray); if (h) { l.scale.z = h.d; if (!hit) hit = h.p; } });
   if (!hit && mouseHover && !renderer.xr.isPresenting) { ray.setFromCamera(mouse, camera); hit = pick(ray)?.p ?? null; }
   setHover(hit); scrollTarget = hit?.type === 'convo' ? (pinned.find((P) => P.id === hit.id)?.convo ?? convo) : hit?.type === 'reader' ? reader : hit?.type === 'dev' && hit.name !== 'board' ? devPanels[hit.name].impl : hit?.type === 'unpin' ? scrollTarget : convo;
-  if (renderer.xr.isPresenting && (scrollTarget.mesh.visible || pinned.length || memory.expanded)) for (const src of renderer.xr.getSession().inputSources) { const ax = src.gamepad?.axes, y = ax ? (ax[3] ?? ax[1] ?? 0) : 0; if (memory.expanded && scrollTarget !== reader) { const x = ax ? (ax[2] ?? ax[0] ?? 0) : 0; if (Math.abs(x) > 0.2) memory.nudge(-x * dt * 1.2, 0); if (Math.abs(y) > 0.2) memory.nudge(0, y * dt * 1.5); } else if (Math.abs(y) > 0.2) scrollTarget.scrollBy(-y * dt * 700); }
+  const fly = { f: 0, s: 0, u: 0, t: 0, boost: 1 };
+  if (renderer.xr.isPresenting && (scrollTarget.mesh.visible || pinned.length || memory.expanded)) for (const src of renderer.xr.getSession().inputSources) { const ax = src.gamepad?.axes, y = ax ? (ax[3] ?? ax[1] ?? 0) : 0; if (memory.expanded && scrollTarget !== reader) { const x = ax ? (ax[2] ?? ax[0] ?? 0) : 0, dz = (v) => (Math.abs(v) > 0.2 ? v : 0); if (src.handedness === 'right') { fly.t += dz(x); fly.u -= dz(y); } else { fly.s += dz(x); fly.f -= dz(y); } if (src.gamepad?.buttons?.[3]?.pressed) fly.boost = 3; } else if (Math.abs(y) > 0.2) scrollTarget.scrollBy(-y * dt * 700); }
+  if (memory.expanded) { // vol dans la galaxie : manette gauche = avancer / côté, droite = tourner / monter, clic du stick = vitesse ×3 ; clavier : W A S D, Q E, flèches gauche/droite
+    const K = (c) => (keys.has(c) ? 1 : 0); fly.f += K('KeyW') - K('KeyS'); fly.s += K('KeyD') - K('KeyA'); fly.u += K('KeyE') - K('KeyQ'); fly.t += K('ArrowRight') - K('ArrowLeft'); if (keys.has('ShiftLeft')) fly.boost = 3;
+    if (fly.f || fly.s || fly.u || fly.t) { const hc = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera; hc.updateMatrixWorld(true); hc.matrixWorld.decompose(flyP, flyQ, flyS); memory.fly(dt, fly, flyG.set(0, 0, -1).applyQuaternion(flyQ)); }
+  }
   controls.enableZoom = !convo.mesh.visible && !pinned.length && !memory.expanded;
   updateDrag(dt); updateBar(); updateDev(); updateRoom(); updateRoomDrag(dt); if (room.group.visible) room.update(dt); boardMove(); env.update(dt); sess.update(dt, now); memory.update(dt, now);
   sess.sessions.forEach((s, id) => { if (now - s.seen > 1800000) { sess.remove(id); refocus(); } });
@@ -442,3 +476,13 @@ renderer.setAnimationLoop(() => { try {
   if (renderer.xr.isPresenting && ++frames % 120 === 1) { const i = renderer.info; clog(`XR frame ${frames} · ${((performance.now() - t0) / 1000).toFixed(1)}s · calls ${i.render.calls} · tris ${i.render.triangles} · tex ${i.memory.textures}`); }
   } catch (e) { if (!errOnce) { errOnce = true; clog('LOOP ' + (e.stack || e)); } }
 });
+
+// petit son à chaque demande d'autorisation : deux notes courtes (WebAudio, aucun fichier) ; ignoré si le navigateur n'a pas encore l'autorisation de jouer du son
+let chimeCtx = null;
+for (const ev of ['pointerdown', 'keydown', 'click']) addEventListener(ev, () => { try { chimeCtx ??= new AudioContext(); chimeCtx.resume(); } catch {} }, { once: true, capture: true }); // le son exige un geste : le clic sur « Entrer en VR » le débloque
+function chime() {
+  try { chimeCtx ??= new AudioContext(); if (chimeCtx.state !== 'running') chimeCtx.resume(); const t0 = chimeCtx.currentTime;
+    [[880, 0], [1320, 0.13]].forEach(([f, d]) => { const o = chimeCtx.createOscillator(), g = chimeCtx.createGain(); o.type = 'sine'; o.frequency.value = f; o.connect(g); g.connect(chimeCtx.destination);
+      g.gain.setValueAtTime(0.0001, t0 + d); g.gain.exponentialRampToValueAtTime(0.25, t0 + d + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d + 0.3); o.start(t0 + d); o.stop(t0 + d + 0.32); });
+  } catch {}
+}

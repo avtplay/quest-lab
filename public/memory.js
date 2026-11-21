@@ -9,8 +9,8 @@ export function createMemory(scene) {
   const MINI = { pos: new THREE.Vector3(0.85, 1.0, -0.7), scale: 0.11 }, FULL = { pos: new THREE.Vector3(0, 1.45, 0), scale: 1 };
   root.position.copy(MINI.pos); root.scale.setScalar(MINI.scale);
   const stars = [], hits = [], clusters = {}; let expanded = false, hover = null, selected = null, data = [];
-  // navigation : l'amas visé est amené devant l'utilisateur ; stick = tourner / avancer, ✕ amas = tout revoir
-  const view = { yaw: 0, pos: FULL.pos.clone() }; let filter = { q: '', types: new Set(), n: 0 }; const norm = (x) => String(x).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  // navigation : l'amas visé est amené devant l'utilisateur ; vol libre (fly) : on avance dans la direction du regard, on se tourne, on monte ; ✕ amas = tout revoir
+  const UP = new THREE.Vector3(0, 1, 0), view = { yaw: 0, pos: FULL.pos.clone() }; let flyUntil = 0; let filter = { q: '', types: new Set(), n: 0 }; const norm = (x) => String(x).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 
   // portail (miniature cliquable)
   const portal = new THREE.Mesh(new THREE.SphereGeometry(0.17, 12, 8), new THREE.MeshBasicMaterial()); portal.material.visible = false; portal.userData.pick = { type: 'memory-open' };
@@ -59,6 +59,14 @@ export function createMemory(scene) {
     focusCluster(name) { const k = clusters[name]; if (!k) return; view.yaw = k.a; view.pos.set(0, 1.4 - k.c.y, 1.2); },
     resetView() { view.yaw = 0; view.pos.copy(FULL.pos); },
     nudge(dyaw, dz) { view.yaw += dyaw; view.pos.z = Math.max(-1.5, Math.min(2.2, view.pos.z + dz)); },
+    // vol libre : f avant/arrière (dans la direction du regard), s côté, u haut/bas, t rotation (chacun de -1 à 1) ; la galaxie bouge en sens inverse de l'utilisateur
+    fly(dt, { f = 0, s = 0, u = 0, t = 0, boost = 1 }, gaze) {
+      flyUntil = performance.now() + 300;
+      if (t) { const d = t * dt * 1.4; view.yaw += d; view.pos.applyAxisAngle(UP, d); }
+      const right = new THREE.Vector3().crossVectors(gaze, UP); if (right.lengthSq() < 1e-4) right.set(1, 0, 0); right.normalize();
+      const v = gaze.clone().multiplyScalar(f).addScaledVector(right, s).addScaledVector(UP, u); if (v.lengthSq() > 1) v.normalize();
+      view.pos.addScaledVector(v, -1.4 * boost * dt); if (view.pos.length() > 9) view.pos.setLength(9); // on ne se perd pas : au plus 9 m du centre
+    },
     get filter() { return filter; },
     // recherche : tous les mots doivent apparaître (sans accents) ; types : liste vide = tous. Renvoie le nombre de souvenirs trouvés.
     setFilter(q, types) {
@@ -77,7 +85,7 @@ export function createMemory(scene) {
       if (!expanded) root.position.lerp(T.pos, Math.min(1, dt * 3.5)); root.scale.setScalar(THREE.MathUtils.lerp(root.scale.x, T.scale, Math.min(1, dt * 3.5)));
       portalHolder.visible = !expanded;
       if (!expanded) { root.rotation.y += dt * 0.25; root.rotation.y %= Math.PI * 2; }
-      else { const d = ((view.yaw - root.rotation.y + Math.PI * 3) % (Math.PI * 2)) - Math.PI; root.rotation.y += d * Math.min(1, dt * 3); root.position.lerp(view.pos, Math.min(1, dt * 3)); }
+      else { const d = ((view.yaw - root.rotation.y + Math.PI * 3) % (Math.PI * 2)) - Math.PI; const k = Math.min(1, dt * (performance.now() < flyUntil ? 10 : 3)); root.rotation.y += d * k; root.position.lerp(view.pos, k); }
       stars.forEach((s) => { const k = 1 + 0.12 * Math.sin(now / 700 + s.ph) + (hover === s.m.id || selected === s.m.id ? 0.7 : 0), q = s.dim ? 0.45 : 1; s.core.scale.setScalar(k * q); s.gl.scale.setScalar(s.size * 7 * k * q); s.gl.material.opacity = s.dim ? 0.08 : 0.7; s.core.material.opacity = s.dim ? 0.3 : 1; s.core.material.transparent = !!s.dim; });
     },
   };

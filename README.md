@@ -49,7 +49,21 @@ node client/install.mjs --runner-dir ~/projets/x    # autorise ce dossier (rép�
 node client/runner.js                               # à laisser tourner (terminal, tmux, service…)
 ```
 
+Option : `"runner": { "allowedTools": ["WebSearch", "WebFetch"] }` dans `~/.quest-lab/config.json` autorise ces outils sans demande (lecture seule) ; tout le reste passe toujours par Autoriser / Refuser. Le **modèle** se choisit avant de lancer : Défaut (celui de la machine), Sonnet, Opus ou Haiku (alias acceptés par `claude --model`).
+
 Le lanceur n'ouvre que les dossiers que tu as listés, jamais ailleurs. Les permissions de la session passent par les boutons Autoriser / Refuser du casque ; sans réponse, une session sans terminal les refuse. Lancements, consignes et fin de session sont consignés dans `data/audit.log`. Comme les autres fonctions de pilotage, cela donne à quiconque détient le jeton un moyen d'exécuter des commandes sur la machine : garde-le secret et n'utilise que le HTTPS.
+
+## Voix (synthèse vocale)
+
+Le bouton `🔊 Voix` lit à voix haute les réponses de l'assistant et les nouvelles réponses de la session sélectionnée (le code, les adresses et la mise en forme sont retirés). Le navigateur du Quest n'a pas toujours de synthèse vocale : le texte passe donc par le bridge, qui le fait lire par un synthétiseur local, 100 % hors ligne ([Piper](https://github.com/OHF-Voice/piper1-gpl)).
+
+```bash
+python3 -m venv tts && tts/bin/pip install piper-tts
+tts/bin/python -m piper.download_voices fr_FR-siwis-medium          # vérifie la licence de la voix que tu choisis
+tts/bin/python client/tts_worker.py fr_FR-siwis-medium.onnx         # à laisser tourner sur une machine
+```
+
+Le synthétiseur se connecte au bridge (comme le lanceur, rien n'écoute chez lui) et renvoie du WAV ; il lui faut seulement `url` et `token` de `~/.quest-lab/config.json`. Sans synthétiseur, la page retombe sur la voix du navigateur si elle existe. Environ 0,3 s pour une phrase sur CPU.
 
 ## Décors et fenêtres
 
@@ -63,6 +77,7 @@ Le lanceur n'ouvre que les dossiers que tu as listés, jamais ailleurs. Les perm
 Dans le mode mémoire, chaque projet est un amas d'étoiles.
 
 - **Naviguer** : touche une étiquette d'amas pour s'en rapprocher ; le bouton de remise à zéro rend la vue d'ensemble.
+- **Voler** : stick gauche = avancer dans la direction du regard et se décaler ; stick droit = tourner et monter/descendre ; clic d'un stick = vitesse ×3. Sur PC : W A S D, Q / E, flèches gauche et droite, Maj pour accélérer. On reste à 9 m du centre au plus.
 - **Lire** : touche une étoile pour afficher le texte complet du souvenir en Markdown, défilable.
 - **Chercher** : la recherche vocale ou texte filtre les étoiles (tous les mots, sans tenir compte des accents) et estompe les autres.
 
@@ -79,6 +94,20 @@ Le bouton `🛠 Atelier` ouvre des panneaux alimentés par la session sélection
 
 - **Schémas** : Claude affiche une architecture avec `node client/diagram.js <session> '{"title":"…","nodes":[{"id":"api","label":"API"},{"id":"db","label":"Base"}],"links":[{"from":"api","to":"db","label":"SQL"}]}'`. La mise en page est automatique, par couches.
 - **Dessin** : dessine au contrôleur sur le tableau ; l'image est envoyée à la session sous la forme `[[board:<id>]]`, que le hook et l'écouteur remplacent par un PNG téléchargé dans `~/.quest-lab/boards/` (les 10 derniers sont gardés).
+
+## Navigateur de développement (lecture seule)
+
+Pour voir dans le casque l'application web qu'une session est en train de développer : un Chromium sans écran, sur la machine de dev, ouvre l'adresse locale et envoie ses images au bridge. Elles s'affichent dans la fenêtre `Web` de l'Atelier (sélectionne la session). WebXR ne sait pas afficher une page web dans la scène 3D : on en montre donc l'image.
+
+```bash
+node client/web.js <session> http://localhost:5173      # à laisser tourner en tâche de fond
+```
+
+- La session peut lire `~/.quest-lab/web/<session>/console.log` (console et erreurs de la page) et `latest.jpg` (dernière image) : elle voit ce que tu vois.
+- Seules les adresses `localhost`, `127.0.0.1` et `[::1]` sont servies ; `--allow-host=nom` en ajoute une, `--size=1280x800` change la taille. Une navigation vers une autre adresse est refusée.
+- Chromium : `CHROME_PATH`, sinon `chromium`, `google-chrome` ou le cache Playwright. Node 22+ (WebSocket intégré).
+- Sur Ubuntu 24.04 le bac à sable de Chromium est parfois refusé : `QUEST_WEB_NO_SANDBOX=1` le désactive. À réserver à tes propres pages locales.
+- Le bridge ne garde que la dernière image par session, en mémoire. Les images peuvent montrer des données de ton application : comme le reste, elles sont protégées par le jeton.
 
 ## Salle blanche
 

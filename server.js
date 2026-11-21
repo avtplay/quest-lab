@@ -88,6 +88,8 @@ for (const f of fs.readdirSync(ROOMS_DIR).filter((x) => x.endsWith('.json'))) { 
 function writeRoom(id) { const R = rooms.get(id); if (!R) return; const tmp = roomFile(id) + '.tmp'; try { fs.writeFileSync(tmp, JSON.stringify({ id, objects: [...R.objects.values()] })); fs.renameSync(tmp, roomFile(id)); } catch {} }
 function saveRoom(id) { clearTimeout(roomTimers.get(id)); roomTimers.set(id, setTimeout(() => { roomTimers.delete(id); writeRoom(id); }, 300)); }
 const flushRooms = () => { for (const id of roomTimers.keys()) { clearTimeout(roomTimers.get(id)); writeRoom(id); } roomTimers.clear(); };
+const webFrames = new Map(); // id de session -> dernière image JPEG du navigateur de dev (mémoire seulement)
+const ttsJobs = [], ttsWait = new Map(), ttsPoll = []; let ttsSeen = 0; // synthèse vocale : le synthétiseur (machine locale) vient chercher les textes et renvoie du WAV ; aucune connexion entrante, aucun secret de plus
 const boards = new Map();  // id de session -> PNG du dernier schéma dessiné dans le casque (mémoire seulement)
 const queues = new Map();  // id de session -> [{ text, at }]
 const transcripts = new Map(); // id de session -> { messages, at } : en mémoire seulement, jamais sur disque
@@ -155,7 +157,7 @@ async function handle(req, res) {
     if (out.id && out.label) { autoLabels.set(out.id, out.label); out.auto = out.label; if (names[out.id]) out.label = names[out.id]; } // le nom choisi l'emporte sur celui du dossier
     for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
     emit(out);
-    if (e.type === 'agent.remove') { if (names[out.id]) { delete names[out.id]; saveNames(); } autoLabels.delete(out.id); runnerSessions.delete(out.id); queues.delete(out.id); transcripts.delete(out.id); dev.delete(out.id); boards.delete(out.id); rooms.delete(out.id); clearTimeout(roomTimers.get(out.id)); roomTimers.delete(out.id); fs.rmSync(roomFile(out.id), { force: true }); clearTimeout(listening.get(out.id)); listening.delete(out.id); for (const [rid, a] of asks) if (a.id === out.id) endAsk(rid, 'pass', 'fin de session'); }
+    if (e.type === 'agent.remove') { if (names[out.id]) { delete names[out.id]; saveNames(); } autoLabels.delete(out.id); runnerSessions.delete(out.id); queues.delete(out.id); transcripts.delete(out.id); dev.delete(out.id); boards.delete(out.id); webFrames.delete(out.id); rooms.delete(out.id); clearTimeout(roomTimers.get(out.id)); roomTimers.delete(out.id); fs.rmSync(roomFile(out.id), { force: true }); clearTimeout(listening.get(out.id)); listening.delete(out.id); for (const [rid, a] of asks) if (a.id === out.id) endAsk(rid, 'pass', 'fin de session'); }
     if (e.inbox === true && e.control === true && queues.get(out.id)?.length) { // livre les consignes en attente à la session
       const texts = takeQueue(out.id); if (texts.length) return json(res, 200, { inbox: texts });
     }
@@ -180,7 +182,8 @@ async function handle(req, res) {
   }
   if (P === '/api/runner/hello' && POST) { // un lanceur se déclare avec ses dossiers autorisés
     const b = JSON.parse(await readBody(req, 8192)), m = safe(b.machine), dirs = (Array.isArray(b.dirs) ? b.dirs : []).slice(0, 30).map((d) => clip(String(d), 300));
-    const r = runners.get(m) ?? { queue: [], waiter: null, on: false }; r.dirs = dirs; r.seen = Date.now(); runners.set(m, r);
+    const r = runners.get(m) ?? { queue: [], waiter: null, on: false }; r.dirs = dirs; r.resumable = (Array.isArray(b.resumable) ? b.resumable : []).slice(0, 12).map((x) => ({ sid: clip(String(x.sid || ''), 80), dir: clip(String(x.dir || ''), 300), title: clip(String(x.title || ''), 80), model: clip(String(x.model || ''), 10), at: +x.at || 0 })); r.seen = Date.now(); runners.set(m, r);
+    for (const x of (Array.isArray(b.sessions) ? b.sessions : []).slice(0, 10)) if (x?.id && x?.sid) runnerSessions.set(clip(String(x.id), 80), { machine: m, sid: clip(String(x.sid), 80) }); // après un redémarrage du bridge, le lanceur rappelle ses sessions vivantes
     if (!r.on) { r.on = true; audit(`lanceur en ligne machine=${m} dossiers=${JSON.stringify(dirs)}`); emit({ type: 'runner.update', machine: m, on: true, dirs }); }
     return json(res, 200, { ok: true });
   }
@@ -199,14 +202,16 @@ async function handle(req, res) {
     emit({ type: 'launch.update', rid: clip(String(b.rid || ''), 20), machine: m, id, status: clip(String(b.event || ''), 20), error: b.error ? clip(String(b.error), 200) : undefined });
     return void res.writeHead(204).end();
   }
-  if (P === '/api/runners') return json(res, 200, { runners: [...runners].map(([machine, r]) => ({ machine, dirs: r.dirs, on: runnerOnline(r) })) });
+  if (P === '/api/runners') return json(res, 200, { runners: [...runners].map(([machine, r]) => ({ machine, dirs: r.dirs, on: runnerOnline(r), resumable: r.resumable || [] })) });
   if (P === '/api/launch' && POST) { // depuis le casque : démarre une nouvelle session sur une machine
-    const b = JSON.parse(await readBody(req, 8192)), m = safe(b.machine), r = runners.get(m), dir = String(b.dir || ''), prompt = clip(String(b.prompt || '').trim(), 2000);
+    const b = JSON.parse(await readBody(req, 8192)), m = safe(b.machine), r = runners.get(m), dir = String(b.dir || (r?.resumable || []).find((x) => x.sid === String(b.resume || ''))?.dir || ''), prompt = clip(String(b.prompt || '').trim(), 2000);
     if (!runnerOnline(r)) return void res.writeHead(409).end('aucun lanceur actif sur cette machine');
     if (!okDir(r, dir)) return void res.writeHead(403).end('dossier non autorisé');
-    if (!prompt) return void res.writeHead(400).end('consigne vide');
-    const rid = crypto.randomBytes(5).toString('hex'); runnerPush(m, { type: 'launch', rid, dir, prompt });
-    audit(`lancement demandé machine=${m} dossier=${dir} rid=${rid} consigne=${JSON.stringify(prompt)}`); emit({ type: 'launch.update', rid, machine: m, status: 'queued' });
+    const resume = b.resume ? String(b.resume) : '';
+    if (resume && !(r.resumable || []).some((x) => x.sid === resume)) return void res.writeHead(404).end('session non reprenable');
+    if (!prompt && !resume) return void res.writeHead(400).end('consigne vide');
+    const model = ['sonnet', 'opus', 'haiku'].includes(b.model) ? b.model : '', rid = crypto.randomBytes(5).toString('hex'); runnerPush(m, { type: 'launch', rid, dir, prompt, model, resume });
+    audit(`lancement demandé machine=${m} dossier=${dir} modèle=${model || 'défaut'} reprise=${resume || '-'} rid=${rid} consigne=${JSON.stringify(prompt)}`); emit({ type: 'launch.update', rid, machine: m, status: 'queued' });
     return json(res, 200, { rid });
   }
   if (P === '/api/rename' && POST) { // donne un nom à une session ; un nom vide rétablit le nom du dossier
@@ -282,6 +287,31 @@ async function handle(req, res) {
     return void res.writeHead(instructCore(id, `Schéma dessiné dans le casque (image) : [[board:${id}]]`)).end();
   }
   if (P === '/api/board') { const buf = boards.get(clip(String(url.searchParams.get('id') || ''), 80)); if (!buf) return void res.writeHead(404).end(); return void res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' }).end(buf); }
+  if (P === '/api/web' && POST) { // navigateur de dev vu dans le casque : une image JPEG par session, la plus récente, en mémoire seulement
+    const id = clip(String(url.searchParams.get('id') || ''), 80); if (!state[id]) return void res.writeHead(404).end('session inconnue');
+    const chunks = []; let n = 0; for await (const c of req) { n += c.length; if (n > 2e6) throw new Error('image trop grosse'); chunks.push(c); }
+    const buf = Buffer.concat(chunks); if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return void res.writeHead(400).end('JPEG attendu');
+    const old = webFrames.get(id); webFrames.set(id, { buf, rev: (old?.rev ?? 0) + 1, at: Date.now(), url: clip(String(url.searchParams.get('url') || ''), 200), title: clip(String(url.searchParams.get('title') || ''), 120) });
+    return void res.writeHead(204).end();
+  }
+  if (P === '/api/web') { const f = webFrames.get(clip(String(url.searchParams.get('id') || ''), 80)); if (!f) return void res.writeHead(404).end();
+    if (+url.searchParams.get('rev') === f.rev) return void res.writeHead(204, { 'x-at': String(f.at) }).end();
+    return void res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store', 'x-rev': String(f.rev), 'x-at': String(f.at), 'x-url': encodeURIComponent(f.url), 'x-title': encodeURIComponent(f.title) }).end(f.buf); }
+  if (P === '/api/tts' && POST) { // depuis le casque : texte -> WAV, fabriqué par le synthétiseur de la machine qui l'a branché (client/tts_worker.py)
+    const text = clip(String(JSON.parse(await readBody(req, 8192)).text || '').trim(), 600); if (!text) return void res.writeHead(400).end('texte vide');
+    if (Date.now() - ttsSeen > 45000) return void res.writeHead(503).end('aucun synthétiseur actif'); if (ttsWait.size >= 4) return void res.writeHead(429).end('trop de demandes');
+    const rid = crypto.randomBytes(5).toString('hex'), job = { rid, text }; const wav = new Promise((ok) => { const t = setTimeout(() => { ttsWait.delete(rid); ok(null); }, 25000); ttsWait.set(rid, (b) => { clearTimeout(t); ttsWait.delete(rid); ok(b); }); });
+    const w = ttsPoll.shift(); if (w) w(job); else ttsJobs.push(job);
+    const buf = await wav; if (!buf) return void res.writeHead(504).end('synthèse trop lente'); return void res.writeHead(200, { 'Content-Type': 'audio/wav', 'Cache-Control': 'no-store' }).end(buf);
+  }
+  if (P === '/api/tts/status') return json(res, 200, { on: Date.now() - ttsSeen < 45000 });
+  if (P === '/api/tts/next') { // long-poll du synthétiseur : un texte à lire, ou 204 au bout de 25 s
+    ttsSeen = Date.now(); const j = ttsJobs.shift(); if (j) return json(res, 200, j);
+    const job = await new Promise((ok) => { const t = setTimeout(() => { const i = ttsPoll.indexOf(f); if (i >= 0) ttsPoll.splice(i, 1); ok(null); }, 25000); const f = (x) => { clearTimeout(t); ok(x); }; ttsPoll.push(f); req.on('close', () => { const i = ttsPoll.indexOf(f); if (i >= 0) { ttsPoll.splice(i, 1); clearTimeout(t); ok(null); } }); });
+    ttsSeen = Date.now(); if (!job) return void res.writeHead(204).end(); if (res.destroyed) { ttsJobs.unshift(job); return; } return json(res, 200, job);
+  }
+  if (P === '/api/tts/result' && POST) { const chunks = []; let n = 0; for await (const c of req) { n += c.length; if (n > 6e6) throw new Error('audio trop gros'); chunks.push(c); }
+    const done = ttsWait.get(String(url.searchParams.get('rid') || '')); if (done) done(Buffer.concat(chunks)); return void res.writeHead(done ? 204 : 410).end(); }
   if (P === '/api/memory/push' && POST) { // une machine envoie sa mémoire
     const b = JSON.parse(await readBody(req, 12 * 1024 * 1024)); const machine = safe(b.machine);
     const list = (Array.isArray(b.memories) ? b.memories : []).slice(0, 2000).map((m) => ({ project: clip(String(m.project), 60), file: clip(String(m.file), 100), name: clip(String(m.name), 120), description: clip(String(m.description || ''), 300),
