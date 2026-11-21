@@ -26,6 +26,21 @@ node client/install.mjs --url http://localhost:8080   # branche les sessions Cla
 Ouvre `http://localhost:8080` (souris : glisser pour tourner, clic pour choisir ; espace : dictée).
 Pour le casque, WebXR exige HTTPS : utilise un tunnel (par exemple `cloudflared tunnel --url http://localhost:8080`) puis ouvre `<url>/?k=<jeton>`.
 
+## Appairer un appareil (QR code)
+
+Plus besoin de saisir le jeton d'accès dans le casque : un appareil sans accès ouvre l'adresse du bridge, arrive sur `/pair` et affiche un **QR code** et un code de 6 caractères. Un appareil déjà autorisé (téléphone, PC) le scanne, ouvre `/approve`, compare le code, puis choisit **Pilotage** ou **Lecture seule**. L'appareil reçoit alors son propre jeton, dans un cookie, et s'ouvre tout seul.
+
+```
+casque : /pair → code + QR ──────────────┐ (le jeton ne lui est remis qu'à lui : l'identifiant d'attente n'est pas dans le QR)
+téléphone : scan → /approve → [Pilotage | Lecture seule] ──▶ bridge ──▶ jeton propre au casque (30 jours)
+```
+
+- **Rôles** : *pilotage* (permissions, consignes, lancement de sessions), *lecture seule* (voir, écouter, interroger l'assistant). Ni l'un ni l'autre ne peut parler comme une machine (hooks, lanceur, synthétiseur) ni approuver d'autres appareils : cela reste réservé au jeton d'accès.
+- **Sécurité** : le code expire en 2 minutes et ne sert qu'une fois ; 6 demandes par minute et par adresse ; les jetons d'appareil sont hachés (SHA-256) dans `data/devices.json`, expirent après 30 jours et se révoquent un par un.
+- **Premier appareil** : le téléphone saisit une fois le jeton d'accès sur `/approve` (gardé dans son navigateur). Depuis une machine déjà configurée : `node client/pair.js approve K7M4QX [view|control]`, `node client/pair.js devices`, `node client/pair.js revoke <id>`.
+- Le lien `/?k=<jeton>` continue de fonctionner (accès complet) ; garde-le pour toi.
+- Tests : `node --test test/pair.test.mjs` (parcours complet, rôles, révocation) ; le QR est encodé par `public/qr.js`, sans dépendance.
+
 ## Piloter les sessions depuis le casque (optionnel, désactivé par défaut)
 
 ```bash
@@ -134,7 +149,7 @@ Voir [DEPLOY.md](DEPLOY.md) et `./deploy.sh`.
 
 ## Sécurité
 
-- Le jeton (`ACCESS_TOKEN`) protège tout ce qui n'est pas un appel local direct : page, événements, LLM, dictée. Traite-le comme un mot de passe.
+- Le jeton (`ACCESS_TOKEN`) protège tout ce qui n'est pas un appel local direct : page, événements, LLM, dictée. Traite-le comme un mot de passe. Les appareils (casque, téléphone) s'appairent par QR code avec leur propre jeton révocable, voir plus haut.
 - Le hook ne bloque jamais Claude Code et n'envoie que : nom du dossier, statut, nom de l'outil, début de la demande en cours, et les fichiers de mémoire.
 - Ne publie jamais `.env` ni `data/`.
 

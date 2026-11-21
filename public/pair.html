@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Quest Lab — appairage</title>
+<style>
+:root{--bg:#070a1c;--fg:#eef2ff;--mut:#9fb0e0;--acc:#8fa6ff;--ok:#38e08f;--bad:#ff8da0}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6ff;--fg:#10163a;--mut:#4a5688;--acc:#3b55d9;--ok:#0a8f55;--bad:#c0273f}}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--fg);font:18px/1.45 system-ui,sans-serif}
+main{max-width:640px;margin:0 auto;padding:32px 16px;text-align:center}
+h1{font-size:28px;margin:0 0 6px}p{color:var(--mut);margin:8px 0}
+canvas{background:#fff;border-radius:16px;padding:0;width:min(78vw,380px);height:auto;image-rendering:pixelated;margin:18px 0 6px}
+.code{font:700 46px/1 ui-monospace,monospace;letter-spacing:.12em;margin:10px 0;color:var(--acc)}
+.st{font-weight:600;margin-top:14px}.ok{color:var(--ok)}.bad{color:var(--bad)}
+button{font:inherit;font-weight:700;background:var(--acc);color:var(--bg);border:0;border-radius:14px;padding:12px 22px;margin-top:12px;cursor:pointer}
+small{color:var(--mut);display:block;margin-top:18px}
+</style></head><body><main>
+<h1>Appairer cet appareil</h1>
+<p>Scanne ce code avec un appareil déjà autorisé (téléphone, PC), puis approuve.</p>
+<canvas id="qr" width="1" height="1" aria-label="QR code d'appairage"></canvas>
+<div class="code" id="code">······</div>
+<div class="st" id="st">Préparation…</div>
+<small id="alt"></small>
+<button id="again" hidden>Nouveau code</button>
+</main>
+<script type="module">
+import { qrMatrix } from './qr.js';
+const $ = (i) => document.getElementById(i), st = $('st'), name = /OculusBrowser|Quest/i.test(navigator.userAgent) ? 'Casque Quest' : /Mobile|Android|iPhone/i.test(navigator.userAgent) ? 'Téléphone' : 'Navigateur';
+let timer = null;
+function draw(text) { const m = qrMatrix(text), q = 4, n = m.length + q * 2, s = 10, c = $('qr'); c.width = c.height = n * s; const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, n * s, n * s); g.fillStyle = '#000'; m.forEach((r, y) => r.forEach((d, x) => d && g.fillRect((x + q) * s, (y + q) * s, s, s))); }
+async function start() {
+  clearInterval(timer); $('again').hidden = true; st.className = 'st'; st.textContent = 'Préparation…';
+  let r; try { r = await fetch('/api/pair/start', { method: 'POST', body: JSON.stringify({ name }) }); } catch { r = null; }
+  if (!r || !r.ok) { st.className = 'st bad'; st.textContent = r?.status === 429 ? 'Trop de demandes : patiente une minute.' : 'Le bridge ne répond pas.'; $('again').hidden = false; return; }
+  const { id, code } = await r.json(), url = `${location.origin}/approve?c=${code}`;
+  $('code').textContent = code; draw(url); $('alt').textContent = `Ou ouvre ${location.origin}/approve et saisis ce code.`; st.textContent = 'En attente d\'approbation…';
+  timer = setInterval(async () => {
+    try { const j = await (await fetch('/api/pair/poll?id=' + id, { cache: 'no-store' })).json();
+      if (j.status === 'approved') { clearInterval(timer); st.className = 'st ok'; st.textContent = 'Appareil autorisé !'; setTimeout(() => location.replace('/'), 600); }
+      else if (j.status === 'expired') { clearInterval(timer); st.className = 'st bad'; st.textContent = 'Code expiré.'; $('again').hidden = false; }
+      else st.textContent = `En attente d'approbation… (${j.left} s)`; } catch {}
+  }, 1500);
+}
+$('again').onclick = start; start();
+</script></body></html>

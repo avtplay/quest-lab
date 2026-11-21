@@ -25,16 +25,36 @@ let TOKEN = process.env.ACCESS_TOKEN;
 if (!TOKEN) { TOKEN = crypto.randomBytes(12).toString('hex'); fs.appendFileSync(path.join(dir, '.env'), `\nACCESS_TOKEN=${TOKEN}\n`); }
 const eq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
 const isLoop = (a = '') => a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
-function authorized(req, res, url) {
+// ---- appareils appairés (QR code) : un jeton par appareil, haché sur disque, révocable, valable 30 jours.
+// Rôles : admin (jeton maître, boucle locale : machines et approbation), control (casque piloté), view (lecture seule).
+const DEV_FILE = path.join(DATA_DIR, 'devices.json'), DEV_TTL = 30 * 24 * 3600e3, sha = (x) => crypto.createHash('sha256').update(x).digest('hex');
+let devices = {}; try { devices = JSON.parse(fs.readFileSync(DEV_FILE, 'utf8')); } catch {}
+const saveDevices = () => fs.writeFile(DEV_FILE, JSON.stringify(devices), { mode: 0o600 }, () => {});
+const pairs = new Map(), pairHits = new Map(); // appairages en cours (id secret -> demande) ; demandes par adresse
+const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // sans 0/O/1/I/L
+const clientIp = (req) => String(req.headers['x-forwarded-for'] || req.headers['cf-connecting-ip'] || req.socket.remoteAddress || '').split(',')[0].trim();
+function deviceOf(req) { // jeton d'appareil : en-tête ou cookie qd
+  const h = req.headers, t = h['x-quest-token'] || (h.authorization || '').replace(/^Bearer\s+/i, '') || ((h.cookie || '').split(/;\s*/).find((c) => c.startsWith('qd=')) || '').slice(3);
+  if (!t || !t.startsWith('qd_')) return null; const hh = sha(t);
+  for (const [id, d] of Object.entries(devices)) if (eq(d.hash, hh)) { if (Date.now() > d.exp) return null; if (Date.now() - d.last > 60000) { d.last = Date.now(); saveDevices(); } return { id, ...d }; }
+  return null;
+}
+function authorized(req, res, url) { // renvoie le rôle ('admin' | 'control' | 'view') ou null
   const h = req.headers, proxied = h['cf-connecting-ip'] || h['x-forwarded-for'] || h['x-real-ip'];
-  if (isLoop(req.socket.remoteAddress) && !proxied) return true;
-  if (eq(h['x-quest-token'] || '', TOKEN) || eq((h.authorization || '').replace(/^Bearer\s+/i, ''), TOKEN)) return true;
+  if (isLoop(req.socket.remoteAddress) && !proxied) return 'admin';
+  if (eq(h['x-quest-token'] || '', TOKEN) || eq((h.authorization || '').replace(/^Bearer\s+/i, ''), TOKEN)) return 'admin';
   if (eq(url.searchParams.get('k') || '', TOKEN)) {
     const secure = h['x-forwarded-proto'] === 'https' || h['cf-visitor'] ? '; Secure' : '';
-    res.setHeader('Set-Cookie', `qk=${TOKEN}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${secure}`); return true;
+    res.setHeader('Set-Cookie', `qk=${TOKEN}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${secure}`); return 'admin';
   }
-  return (h.cookie || '').split(/;\s*/).some((c) => c.startsWith('qk=') && eq(c.slice(3), TOKEN));
+  if ((h.cookie || '').split(/;\s*/).some((c) => c.startsWith('qk=') && eq(c.slice(3), TOKEN))) return 'admin';
+  return deviceOf(req)?.role ?? null;
 }
+// routes réservées aux machines (hooks, lanceur, synthétiseur) et à l'administration : refusées aux appareils appairés
+const MACHINE_GET = new Set(['/api/listen', '/api/tts/next', '/api/runner/hello', '/api/runner/poll', '/api/runner/report', '/api/devices', '/api/pair/info']);
+const MACHINE_POST = new Set(['/api/event', '/api/ask', '/api/transcript', '/api/dev', '/api/web', '/api/memory/push', '/api/tts/result', '/api/runner/hello', '/api/runner/report', '/api/devices/revoke', '/api/pair/approve']);
+const VIEW_POST = new Set(['/api/tts', '/api/chat', '/api/stt', '/api/clientlog']); // un appareil en lecture seule ne peut que lire, écouter et parler à l'assistant
+const PUBLIC_PAGES = { '/pair': 'pair.html', '/approve': 'approve.html', '/qr.js': 'qr.js' };
 
 // ---- événements + persistance des sessions (survit aux redémarrages)
 const STATE = path.join(DATA_DIR, 'state.json');
@@ -138,8 +158,44 @@ function instructCore(id, text) {
 async function handle(req, res) {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/health') { res.writeHead(200).end('ok'); return; }
-  if (!authorized(req, res, url)) { res.writeHead(403).end('403'); return; }
-  const P = url.pathname, POST = req.method === 'POST';
+  const role = authorized(req, res, url), P = url.pathname, POST = req.method === 'POST';
+  if (P === '/api/pair/start' && POST) { // un appareil sans accès demande un code d'appairage (limité : 6 par minute et par adresse)
+    const ip = clientIp(req), now = Date.now(), hits = (pairHits.get(ip) || []).filter((t) => now - t < 60000);
+    for (const [k, v] of pairs) if (now > v.exp + 60000) pairs.delete(k);
+    if (hits.length >= 6 || pairs.size >= 40) return void res.writeHead(429).end('trop de demandes');
+    pairHits.set(ip, [...hits, now]); let name = 'Appareil'; try { name = clip(String(JSON.parse(await readBody(req, 2048)).name || 'Appareil'), 40).replace(/[^\p{L}\p{N} ._'-]/gu, '') || 'Appareil'; } catch {}
+    const id = crypto.randomBytes(12).toString('hex'); let code = ''; do { code = Array.from(crypto.randomBytes(6), (b) => CODE_CHARS[b % CODE_CHARS.length]).join(''); } while ([...pairs.values()].some((v) => v.code === code));
+    pairs.set(id, { code, name, ip, exp: now + 120000 }); audit(`appairage demandé nom=${JSON.stringify(name)} code=${code} ip=${ip}`);
+    return json(res, 200, { id, code, name, ttl: 120 });
+  }
+  if (P === '/api/pair/poll') { // l'appareil attend l'approbation ; le jeton ne lui est remis qu'à lui (l'id secret n'apparaît pas dans le QR)
+    const id = String(url.searchParams.get('id') || ''), v = pairs.get(id);
+    if (!v || Date.now() > v.exp) { pairs.delete(id); return json(res, 200, { status: 'expired' }); }
+    if (!v.approved) return json(res, 200, { status: 'pending', left: Math.round((v.exp - Date.now()) / 1000) });
+    pairs.delete(id); const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `qd=${v.approved.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${DEV_TTL / 1000}${secure}`); return json(res, 200, { status: 'approved' });
+  }
+  if (!role) {
+    if (req.method === 'GET' && P === '/') { res.writeHead(302, { Location: '/pair' }).end(); return; } // pas d'accès : on propose l'appairage
+    const page = req.method === 'GET' && PUBLIC_PAGES[P];
+    if (page) { res.writeHead(200, { 'Content-Type': MIME[path.extname(page)] || 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' }); fs.createReadStream(path.join(dir, 'public', page)).pipe(res); return; }
+    res.writeHead(403).end('403'); return;
+  }
+  if (role !== 'admin' && (POST ? MACHINE_POST.has(P) : MACHINE_GET.has(P))) return void res.writeHead(403).end('réservé aux machines');
+  if (role === 'view' && POST && !VIEW_POST.has(P)) return void res.writeHead(403).end('appareil en lecture seule');
+  if (P === '/api/pair/info') { // l'approbateur vérifie le code affiché sur l'appareil
+    const code = String(url.searchParams.get('code') || '').toUpperCase(), v = [...pairs.values()].find((x) => x.code === code && Date.now() < x.exp && !x.approved);
+    return v ? json(res, 200, { name: v.name, code: v.code, left: Math.round((v.exp - Date.now()) / 1000) }) : void res.writeHead(404).end('code inconnu ou expiré');
+  }
+  if (P === '/api/pair/approve' && POST) {
+    const b = JSON.parse(await readBody(req, 2048)), code = String(b.code || '').toUpperCase(), v = [...pairs.values()].find((x) => x.code === code && Date.now() < x.exp && !x.approved);
+    if (!v) return void res.writeHead(404).end('code inconnu ou expiré');
+    const r = b.role === 'view' ? 'view' : 'control', token = 'qd_' + crypto.randomBytes(16).toString('hex'), id = crypto.randomBytes(4).toString('hex'), name = clip(String(b.name || v.name), 40);
+    devices[id] = { name, role: r, hash: sha(token), created: Date.now(), last: 0, exp: Date.now() + DEV_TTL }; saveDevices(); v.approved = { id, token };
+    audit(`appairage approuvé appareil=${id} nom=${JSON.stringify(name)} rôle=${r} code=${code}`); return json(res, 200, { ok: true, id });
+  }
+  if (P === '/api/devices') return json(res, 200, { devices: Object.entries(devices).map(([id, d]) => ({ id, name: d.name, role: d.role, created: d.created, last: d.last, exp: d.exp })) });
+  if (P === '/api/devices/revoke' && POST) { const id = String(JSON.parse(await readBody(req, 512)).id || ''); if (!devices[id]) return void res.writeHead(404).end('appareil inconnu'); audit(`appareil révoqué ${id} nom=${JSON.stringify(devices[id].name)}`); delete devices[id]; saveDevices(); return json(res, 200, { ok: true }); }
 
   if (P === '/poll') { // lecture régulière : robuste derrière tunnel / proxy
     lastPoll = Date.now(); const since = +url.searchParams.get('since') || 0;

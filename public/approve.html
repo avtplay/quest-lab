@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Quest Lab — approuver</title>
+<style>
+:root{--bg:#070a1c;--card:#121838;--fg:#eef2ff;--mut:#9fb0e0;--acc:#8fa6ff;--ok:#38e08f;--bad:#ff8da0;--line:#2a3470}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6ff;--card:#fff;--fg:#10163a;--mut:#4a5688;--acc:#3b55d9;--ok:#0a8f55;--bad:#c0273f;--line:#cfd6f5}}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--fg);font:17px/1.45 system-ui,sans-serif}
+main{max-width:560px;margin:0 auto;padding:24px 16px}
+h1{font-size:26px;margin:0 0 12px}h2{font-size:19px;margin:28px 0 8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin:12px 0}
+input{font:inherit;width:100%;box-sizing:border-box;padding:12px;border-radius:12px;border:1px solid var(--line);background:transparent;color:var(--fg)}
+button{font:inherit;font-weight:700;border:0;border-radius:12px;padding:12px 16px;margin:8px 8px 0 0;cursor:pointer;background:var(--acc);color:var(--bg)}
+button.alt{background:transparent;color:var(--fg);border:1px solid var(--line)}button.bad{background:var(--bad);color:#200}
+.mut{color:var(--mut);font-size:15px}.code{font:700 30px ui-monospace,monospace;letter-spacing:.1em;color:var(--acc)}
+.ok{color:var(--ok)}.err{color:var(--bad)}
+li{list-style:none;padding:10px 0;border-top:1px solid var(--line)}ul{padding:0;margin:0}
+</style></head><body><main>
+<h1>Approuver un appareil</h1>
+<div class="card" id="auth" hidden><p class="mut">Saisis le jeton d'accès du bridge (gardé dans ce navigateur uniquement).</p><input id="tok" type="password" autocomplete="off" placeholder="Jeton d'accès"><button id="go">Continuer</button></div>
+<div class="card" id="ask" hidden>
+  <p class="mut">Code affiché sur l'appareil :</p><input id="code" maxlength="6" autocapitalize="characters" autocomplete="off" placeholder="K7M4QX" style="text-transform:uppercase"><button id="check" class="alt">Vérifier</button>
+  <div id="who" hidden><p>Autoriser <b id="nm"></b> ? Compare ce code avec celui de son écran : <span class="code" id="cc"></span></p>
+    <button data-r="control">Pilotage</button><button data-r="view" class="alt">Lecture seule</button><button id="no" class="bad">Refuser</button>
+    <p class="mut">Pilotage : permissions, consignes, lancement de sessions. Lecture seule : voir, écouter, interroger l'assistant.</p></div>
+</div>
+<p id="msg" class="mut" role="status"></p>
+<h2>Appareils autorisés</h2><div class="card"><ul id="list"></ul><p class="mut" id="none" hidden>Aucun appareil appairé.</p></div>
+</main>
+<script>
+const $ = (i) => document.getElementById(i); let tok = ''; try { tok = localStorage.getItem('questlab.master') || ''; } catch {}
+const api = async (p, body) => fetch(p, { method: body ? 'POST' : 'GET', headers: { 'x-quest-token': tok, 'content-type': 'application/json' }, body: body && JSON.stringify(body) });
+const say = (t, cls = '') => { $('msg').textContent = t; $('msg').className = 'mut ' + cls; };
+async function boot() {
+  const r = await api('/api/devices'); if (r.status === 403 || r.status === 401) { $('auth').hidden = false; $('ask').hidden = true; return; }
+  $('auth').hidden = true; $('ask').hidden = false; await list(); const c = new URLSearchParams(location.search).get('c'); if (c) { $('code').value = c; check(); }
+}
+async function list() {
+  const { devices } = await (await api('/api/devices')).json(), ul = $('list'); ul.textContent = ''; $('none').hidden = devices.length > 0;
+  for (const d of devices) { const li = document.createElement('li'), b = document.createElement('button'); b.className = 'alt'; b.textContent = 'Révoquer';
+    b.onclick = async () => { await api('/api/devices/revoke', { id: d.id }); list(); };
+    const t = document.createElement('div'); t.textContent = `${d.name} · ${d.role === 'view' ? 'lecture seule' : 'pilotage'}`; const m = document.createElement('div'); m.className = 'mut';
+    m.textContent = `vu ${d.last ? new Date(d.last).toLocaleString('fr-FR') : 'jamais'} · expire le ${new Date(d.exp).toLocaleDateString('fr-FR')}`; li.append(t, m, b); ul.append(li); }
+}
+async function check() {
+  const code = $('code').value.trim().toUpperCase(); if (!code) return; const r = await api('/api/pair/info?code=' + encodeURIComponent(code));
+  if (!r.ok) { $('who').hidden = true; say('Code inconnu ou expiré. Demande un nouveau code sur l\'appareil.', 'err'); return; }
+  const j = await r.json(); $('nm').textContent = j.name; $('cc').textContent = j.code; $('who').hidden = false; say(''); $('who').dataset.code = j.code;
+}
+async function decide(role) { const code = $('who').dataset.code, r = await api('/api/pair/approve', { code, role, name: $('nm').textContent });
+  if (r.ok) { say('Appareil autorisé. Il va s\'ouvrir tout seul.', 'ok'); $('who').hidden = true; $('code').value = ''; list(); } else say('Échec de l\'approbation (code expiré ?).', 'err'); }
+$('go').onclick = async () => { tok = $('tok').value.trim(); const r = await api('/api/devices'); if (!r.ok) { say('Jeton refusé.', 'err'); return; } try { localStorage.setItem('questlab.master', tok); } catch {} say(''); boot(); };
+$('check').onclick = check; $('code').addEventListener('keydown', (e) => e.key === 'Enter' && check());
+document.querySelectorAll('[data-r]').forEach((b) => (b.onclick = () => decide(b.dataset.r))); $('no').onclick = () => { $('who').hidden = true; say('Refusé.'); };
+boot();
+</script></body></html>
